@@ -1055,8 +1055,8 @@ extern POBJECT_TYPE* IoFileObjectType;
 NTSTATUS DumpProcessoAtivoPorPEPROCESS(PEPROCESS ProcessoAlvo, PVOID* OutBuffer, PSIZE_T OutSize) {
     // 2. Obter o ImageBase do processo
     // Usamos aquela função que declaramos antes
-    PVOID BaseEndereço = PsGetProcessSectionBaseAddress(ProcessoAlvo);
-    if (BaseEndereço == NULL) {
+    PVOID BaseEndereco = PsGetProcessSectionBaseAddress(ProcessoAlvo);
+    if (BaseEndereco == NULL) {
         ObDereferenceObject(ProcessoAlvo);
         return STATUS_NOT_FOUND;
     }
@@ -1079,7 +1079,7 @@ NTSTATUS DumpProcessoAtivoPorPEPROCESS(PEPROCESS ProcessoAlvo, PVOID* OutBuffer,
     SIZE_T copiado = 0;
     NTSTATUS status = MmCopyVirtualMemory(
         ProcessoAlvo,
-        BaseEndereço,
+        BaseEndereco,
         PsGetCurrentProcess(),
         bufferBruto,
         tamanhoImagem,

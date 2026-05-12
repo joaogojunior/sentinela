@@ -1,0 +1,13 @@
+/startgui.bat
+/workers_log.txt
+/.idea
+/dist/
+/sentinela.json
+/fangfrisch.conf
+/lang/
+/Sentinela_gui/Sentinela Zero-Trust.spec
+/Sentinela_gui/dist/
+/Sentinela_gui/build/
+/Sentinela_gui/__pycache__/
+/Sentinela_gui/pyinstaller_build_date.py
+/venv/

@@ -2,14 +2,14 @@
 #define _SHARED_LOGIC_H_
 
 #ifdef _KERNEL_MODE
-// Se estiver no Driver, usa as definiÁıes reais do Windows
+// Se estiver no Driver, usa as defini√ß√µes reais do Windows
 #include <ntddk.h>
 // #include <ntstrsafe.h>
 
 #else
 // --- PONTE DE COMPATIBILIDADE ---
 
-// 1. Inclusıes b·sicas de sistema
+// 1. Inclus√µes b√°sicas de sistema
 #include <stdio.h>
 #include <windows.h>
 #include <iostream>
@@ -34,7 +34,7 @@
 #define STATUS_ACCESS_DENIED ((NTSTATUS)0xC0000022L)
 #define POOL_FLAG_NON_PAGED 0x0000000000000040UI64
 
-// 3. A STRUCT (Precisa vir antes das funÁıes que usam PUNICODE_STRING)
+// 3. A STRUCT (Precisa vir antes das fun√ß√µes que usam PUNICODE_STRING)
 typedef struct _UNICODE_STRING {
     USHORT Length;
     USHORT MaximumLength;
@@ -49,7 +49,7 @@ typedef unsigned long ACCESS_MASK;
 // Estruturas simplificadas para o Mock
 typedef struct _DEVICE_OBJECT {
     PVOID DeviceExtension;
-    // No seu caso, podemos guardar o nome do volume aqui para o prÛximo mock ler
+    // No seu caso, podemos guardar o nome do volume aqui para o pr√≥ximo mock ler
     WCHAR VolumeName[64];
 } DEVICE_OBJECT, * PDEVICE_OBJECT;
 
@@ -58,7 +58,7 @@ typedef struct _FILE_OBJECT {
 } FILE_OBJECT, * PFILE_OBJECT;
 
 
-// 5. ProtÛtipos e Inline Functions (Mocks)
+// 5. Prot√≥tipos e Inline Functions (Mocks)
 #define RtlCopyMemory memcpy
 #define RtlZeroMemory(D, L) memset(D, 0, L)
 #define DbgPrint printf
@@ -72,7 +72,7 @@ inline HRESULT RtlUnicodeStringCopy(PUNICODE_STRING DestinationString, PCUNICODE
     if (!DestinationString || !SourceString || !DestinationString->Buffer || !SourceString->Buffer)
         return E_INVALIDARG;
 
-    // Calcula quantos caracteres cabem no destino (incluindo espaÁo para o \0)
+    // Calcula quantos caracteres cabem no destino (incluindo espa√ßo para o \0)
     size_t destCapacityInChars = DestinationString->MaximumLength / sizeof(WCHAR);
     // Quantos caracteres copiar da origem
     size_t charsToCopy = SourceString->Length / sizeof(WCHAR);
@@ -89,7 +89,7 @@ inline HRESULT RtlUnicodeStringCopy(PUNICODE_STRING DestinationString, PCUNICODE
     return E_FAIL;
 }
 
-// SimulaÁ„o de RtlUnicodeStringCat usando wcscat_s
+// Simula√ß√£o de RtlUnicodeStringCat usando wcscat_s
 inline HRESULT RtlUnicodeStringCat(PUNICODE_STRING DestinationString, PCUNICODE_STRING SourceString) {
 
     if (!DestinationString || !SourceString || !DestinationString->Buffer || !SourceString->Buffer) {
@@ -100,7 +100,7 @@ inline HRESULT RtlUnicodeStringCat(PUNICODE_STRING DestinationString, PCUNICODE_
     size_t destCapacityInChars = DestinationString->MaximumLength / sizeof(WCHAR);
 
     // wcscat_s anexa SourceString->Buffer ao final de DestinationString->Buffer
-    // Ela verifica automaticamente se h· espaÁo suficiente e garante o \0 final.
+    // Ela verifica automaticamente se h√° espa√ßo suficiente e garante o \0 final.
     errno_t err = wcscat_s(DestinationString->Buffer, destCapacityInChars, SourceString->Buffer);
 
     if (err == 0) {
@@ -133,7 +133,7 @@ inline VOID RtlCopyUnicodeString(PUNICODE_STRING Dest, PUNICODE_STRING Src) {
     Dest->Length = len;
 }
 
-// Mock da FunÁ„o
+// Mock da Fun√ß√£o
 NTSTATUS IoGetDeviceObjectPointer(
     PUNICODE_STRING ObjectName,
     ACCESS_MASK DesiredAccess,
@@ -153,7 +153,7 @@ NTSTATUS IoGetDeviceObjectPointer(
         return (NTSTATUS)0xC000009A; // STATUS_INSUFFICIENT_RESOURCES
     }
 
-    // 3. Simula a associaÁ„o
+    // 3. Simula a associa√ß√£o
     // Copiamos o nome para o DeviceObject para que o mock da IoQuery possa usar depois
     wcsncpy_s(pDev->VolumeName, ObjectName->Buffer, ObjectName->Length / sizeof(WCHAR));
     pDev->VolumeName[ObjectName->Length / sizeof(WCHAR)] = L'\0';
@@ -178,19 +178,19 @@ inline NTSTATUS IoVolumeDeviceToDosName(PDEVICE_OBJECT DeviceObj, PUNICODE_STRIN
     WCHAR driveLetter = L'Z';
     WCHAR lastChar;
 
-    // ... (sua lÛgica de descoberta da driveLetter continua igual) ...
+    // ... (sua l√≥gica de descoberta da driveLetter continua igual) ...
     if (pathLen > 0) {
-        // Pega o caractere na ˙ltima posiÁ„o v·lida
+        // Pega o caractere na √∫ltima posi√ß√£o v√°lida
         lastChar = DeviceName.Buffer[pathLen - 1];
         //printf("lastChar: %lc\n", lastChar);
         // Print de debug no Console (Ring 3)
-        // %lc È para caractere largo (wchar_t)
+        // %lc √© para caractere largo (wchar_t)
 
-        // A lÛgica de convers„o que vocÍ pediu:
+        // A l√≥gica de convers√£o que voc√™ pediu:
         driveLetter = (WCHAR)(L'A' + (lastChar - L'1'));
         //printf("driveLetter: %lc\n", driveLetter);
     }
-    // O Kernel N√O aloca a estrutura UNICODE_STRING, ele preenche a que vocÍ passou.
+    // O Kernel N√ÉO aloca a estrutura UNICODE_STRING, ele preenche a que voc√™ passou.
     // Ele aloca apenas o BUFFER. No Kernel seria PagedPool, no Mock usamos malloc.
 
     DosPath->MaximumLength = 14;
@@ -204,8 +204,8 @@ inline NTSTATUS IoVolumeDeviceToDosName(PDEVICE_OBJECT DeviceObj, PUNICODE_STRIN
     swprintf_s(DosPath->Buffer, 7, L"%lc:", driveLetter);
     DosPath->Length = 2 * sizeof(WCHAR); // 4 bytes
 
-    // N√O faÁa "DosPath = dosName", pois DosPath j· È o endereÁo correto 
-    // da vari·vel 'dosName' que vocÍ criou no cÛdigo que chama.
+    // N√ÉO fa√ßa "DosPath = dosName", pois DosPath j√° √© o endere√ßo correto 
+    // da vari√°vel 'dosName' que voc√™ criou no c√≥digo que chama.
 
     //printf("[MOCK] Retornando para o chamador: %wZ\n", DosPath);
     return 0;

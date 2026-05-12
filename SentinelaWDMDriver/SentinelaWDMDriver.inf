@@ -16,7 +16,7 @@ DefaultDestDir = 12          ; Direciona para system32\drivers
 [SourceDisksFiles]
 SentinelaWDMDriver.sys = 1,,
 
-; ESTA … A PARTE QUE CORRIGE O ERRO DE "PRIMITIVE DRIVER"
+; ESTA √â A PARTE QUE CORRIGE O ERRO DE "PRIMITIVE DRIVER"
 [DefaultInstall.NTamd64]
 CopyFiles = Sentinela.CopyFiles
 
@@ -34,5 +34,5 @@ ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\SentinelaWDMDriver.sys
 
 [Strings]
-ManufacturerName = "Jo„o Guilherme de Oliveira Jr. <joaogojunior@gmail.com>"
+ManufacturerName = "Jo√£o Guilherme de Oliveira Jr. <joaogojunior@gmail.com>"
 DiskName         = "Disco de Instalacao Sentinela"

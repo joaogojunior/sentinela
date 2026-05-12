@@ -8,6 +8,10 @@
 
 #else
 // --- PONTE DE COMPATIBILIDADE ---
+/* Esse codigo foi escrito para poder compilar o converte_nomes_sl fora do kernel,
+o motivo foi poder testar a conversao de string sem a necessidade de recompilar o 
+kernel inteiro para testar as implementacoes das conversoes de nomes. 
+*/
 
 // 1. Inclusões básicas de sistema
 #include <stdio.h>

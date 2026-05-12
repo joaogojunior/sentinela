@@ -1,0 +1,38 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = SentinelaWDMDriver.cat
+DriverVer   = 05/04/2026,0.2.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 12          ; Direciona para system32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+SentinelaWDMDriver.sys = 1,,
+
+; ESTA É A PARTE QUE CORRIGE O ERRO DE "PRIMITIVE DRIVER"
+[DefaultInstall.NTamd64]
+CopyFiles = Sentinela.CopyFiles
+
+[Sentinela.CopyFiles]
+SentinelaWDMDriver.sys
+
+[DefaultInstall.NTamd64.Services]
+AddService = SentinelaWDMDriver,0x00000002,Sentinela_Service
+
+[Sentinela_Service]
+DisplayName    = "Sentinela Service"
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\SentinelaWDMDriver.sys
+
+[Strings]
+ManufacturerName = "João Guilherme de Oliveira Jr. <joaogojunior@gmail.com>"
+DiskName         = "Disco de Instalacao Sentinela"

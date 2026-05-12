@@ -1,0 +1,2462 @@
+// Cabeçalho principal para o desenvolvimento de drivers Windows
+#include <ntifs.h>
+
+//#include <ntddk.h>
+#include <ntimage.h>
+#include "converte_nomes_sl.h"
+//#include <fltKernel.h>
+
+// IOCTLs para comunicação com o Python
+#define IOCTL_REG_EVENT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GET_ITEM    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_VERDICT     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_UNREG_EVENT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GET_STATUS  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SET_CONFIG  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_PID_DUMP    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Caminho do dispositivo do driver
+#define DRIVER_SYMLINK L"\\DosDevices\\SentinelaDriver"
+#define DRIVER_DEVNAME L"\\Device\\SentinelaDriver"
+
+// Estruturas de Dados
+// --- ESTRUTURAS DE DADOS (CONTEXTOS) ---
+
+// estrutura para requisicao do dump por pid
+typedef struct _PID_DUMP_REQUEST {
+    HANDLE ProcessId; // ID do processo para o qual o dump deve ser gerado
+    LONG DllNameLength; // indica o tamanaho do nome da dll a procurar (se identificado)
+} PID_DUMP_REQUEST, * PPID_DUMP_REQUEST;
+
+// estrutura para resposta do dump por pid
+typedef struct _PID_DUMP_RESPONSE {
+    HANDLE ProcessId; // ID do processo para o qual o dump foi gerado
+	ULONG DumpSize;    // Tamanho do dump gerado
+} PID_DUMP_RESPONSE, * PPID_DUMP_RESPONSE;
+
+// estrutura para resposta do status enviado ao python.
+typedef struct _STATUS_RESPONSE {
+    ULONG CacheCount;     // Quantidade de itens no cache de integridade
+    LONG QueueCount;     // Quantidade de itens pendentes na fila
+    LONG ActiveThreads;   // Quantidade de threads ativas processando a fila
+	LONG ContadorTimeouts; // Quantidade de timeouts ocorridos
+	LONG QueueMaxThreshold; // Limite máximo de itens na fila antes de entrar em modo bypass
+	ULONG CacheMaxEntries; // Limite máximo de entradas no cache
+	LONG TempoTimeout;    // Tempo limite para resposta do monitor Python (em segundos)
+	BOOLEAN FailClose;    // Indica como esta a configuracao de FailClose (1 = Fail Close, 0 = Fail Open)
+} STATUS_RESPONSE, * PSTATUS_RESPONSE;
+
+// estrutura para pacote de configuracao enviado pelo Python para o Driver
+typedef struct _SAVE_SETTINGS {
+    LONG QueueMaxThreshold; // Limite máximo de itens na fila antes de entrar em modo bypass
+    ULONG CacheMaxEntries; // Limite máximo de entradas no cache
+    LONG TempoTimeout;    // Tempo limite para resposta do monitor Python (em segundos)
+    BOOLEAN FailClose;    // Indica como esta a configuracao de FailClose (1 = Fail Close, 0 = Fail Open)
+} SAVE_SETTINGS, * PSAVE_SETTINGS;
+
+// Estrutura para armazenar arquivos já aprovados (Cache de Performance)
+typedef struct _CACHE_ENTRY {
+    LIST_ENTRY ListEntry; // Link oficial do Windows para listas encadeadas
+    ULONG PathHash; // Identificador rápido do caminho do arquivo
+    LARGE_INTEGER LastWriteTime; // "Impressão digital": Data de modificação
+    LARGE_INTEGER FileSize; // "Impressão digital": Tamanho em bytes
+} CACHE_ENTRY, * PCACHE_ENTRY;
+
+// Estrutura para armazenar metadados do arquivo, a resposta a ser dada e event handler para finalizar
+typedef struct _SCAN_RESPONSE_QUEUE {
+    LIST_ENTRY ListEntry; // Link oficial do Windows para listas encadeadas
+    HANDLE ProcessId; // ID do processo que fez a requisição
+    KEVENT ResponseEvent;
+    UNICODE_STRING FileName;
+    NTSTATUS Status;
+    LARGE_INTEGER MTime;    // q -> 8 bytes
+    LARGE_INTEGER FSize;    // q -> 8 bytes
+    ULONG StillAlive;
+} SCAN_RESPONSE_QUEUE, * PSCAN_RESPONSE_QUEUE;
+
+// item que vai permanecer na fila ate que um worker acorde e receba-o
+typedef struct _SCAN_CONTEXT {
+    LIST_ENTRY ListEntry;
+    HANDLE ProcessId;
+    PSCAN_RESPONSE_QUEUE ResponseContext;
+    PVOID PEDUMP;
+    ULONG PEDUMP_Length;
+} SCAN_CONTEXT, * PSCAN_CONTEXT;
+
+// Estrutura do pacote de dados enviado pelo Python para o Driver
+typedef struct _VERDICT_PACKET {
+    HANDLE ProcessId;     // Q (8 bytes)
+    PVOID ContextPointer; // Q (8 bytes) - O endereço de memória do ctx_scan
+    BOOLEAN Verdict;      // ? (1 byte)
+	CHAR Padding[7];      // 7 bytes de preenchimento para alinhamento (total 24 bytes)
+} VERDICT_PACKET, * PVERDICT_PACKET;
+
+#define MAX_TRACKED_ITEMS 500  // Limite máximo para evitar consumo excessivo
+
+typedef struct _TRACKED_DLL {
+    LIST_ENTRY ListEntry;
+    UNICODE_STRING FullPath;
+} TRACKED_DLL, * PTRACKED_DLL;
+
+/*
+LIST_ENTRY g_TrackedDllList;
+KGUARDED_MUTEX g_ListMutex;
+ULONG g_ItemCount = 0;  // Contador de itens ativos
+PFLT_FILTER g_FilterHandle = NULL;
+*/
+
+// Função auxiliar para liberar a memória de uma entrada
+void LiberarEntrada(PTRACKED_DLL Entry) {
+    if (Entry->FullPath.Buffer) {
+        ExFreePoolWithTag(Entry->FullPath.Buffer, 'strg');
+    }
+    ExFreePoolWithTag(Entry, 'trck');
+}
+
+// --- VARIÁVEIS GLOBAIS ---
+LIST_ENTRY g_ScanQueueHead; // Cabeça da fila de espera
+LIST_ENTRY g_CacheListHead; // Cabeça da lista de cache
+LIST_ENTRY g_ScanResponseQueueHead; // Cabeça da lista de metadados dos arquivos a serem escaneados
+KSPIN_LOCK g_GlobalLock; // "Trava" para evitar que 2 CPUs mexam nas listas ao mesmo tempo
+ULONG      g_CacheCount = 0;
+PKEVENT    g_MonitorEvent = NULL; // Evento sinalizado para "acordar" o Python
+PDEVICE_OBJECT g_DeviceObject = NULL;
+UNICODE_STRING g_SymLink = RTL_CONSTANT_STRING(DRIVER_SYMLINK);
+HANDLE g_MonitorPid = NULL;
+HANDLE g_ClamdPid = NULL;
+
+BOOLEAN g_Debug = FALSE;
+UNICODE_STRING g_winSystem32Path = { 0 }; // Guardará "C:\Windows\System32"
+UNICODE_STRING g_DevicePrefix = { 0 }; // Guardará "\Device\HarddiskVolumeX"
+
+LONG g_ActiveThreads = 0;
+KEVENT g_UnloadEvent;
+
+// inicializa o lock do cache (eresource é mais eficiente para leitura, que é o caso do cache)
+ERESOURCE g_CacheResource; // O objeto do Lock
+BOOLEAN g_CacheResourceInitialized = FALSE;
+
+// monitor python ativo
+PFILE_OBJECT g_PythonFileObject = NULL; // Vincula o monitor ao Handle aberto
+LONG g_PythonActive = 0;                // 1 = Ativo, 0 = Bypass
+LONG g_QueueCount = 0;                  // Saldo de itens pendentes na fila
+LONG g_QUEUE_MAX_THRESHOLD = 200;
+
+const UNICODE_STRING g_exeExt = RTL_CONSTANT_STRING(L".exe");
+
+// contador de timeouts
+LONG g_contador_timeouts = 0;
+BOOLEAN g_fail_close = FALSE;
+
+LONG g_TEMPO_TIMEOUT = 60;
+ULONG g_MAX_CACHE_ENTRIES = 2048;
+
+// Definição da Whitelist como UNICODE_STRING direta
+const UNICODE_STRING g_exe_Whitelist[] = {
+        RTL_CONSTANT_STRING(L"smss.exe"), RTL_CONSTANT_STRING(L"csrss.exe"),
+        RTL_CONSTANT_STRING(L"wininit.exe"), RTL_CONSTANT_STRING(L"services.exe"),
+        RTL_CONSTANT_STRING(L"lsass.exe"), RTL_CONSTANT_STRING(L"winlogon.exe"),
+        RTL_CONSTANT_STRING(L"svchost.exe"), RTL_CONSTANT_STRING(L"SecurityHealthService.exe"),
+        RTL_CONSTANT_STRING(L"Wininit.exe"), RTL_CONSTANT_STRING(L"consent.exe"),
+        RTL_CONSTANT_STRING(L"securekernel.exe"), RTL_CONSTANT_STRING(L"lsaiso.exe")
+};
+
+const UNICODE_STRING g_dll_WhiteList[] = {
+    RTL_CONSTANT_STRING(L"ws2_32.dll"), RTL_CONSTANT_STRING(L"WLDAP32.dll"),
+    RTL_CONSTANT_STRING(L"advapi32.dll"), RTL_CONSTANT_STRING(L"clbcatq.dll"),
+    RTL_CONSTANT_STRING(L"user32.dll"), RTL_CONSTANT_STRING(L"shlwapi.dll"),
+    RTL_CONSTANT_STRING(L"shell32.dll"), RTL_CONSTANT_STRING(L"shcore.dll"),
+    RTL_CONSTANT_STRING(L"Setupapi.dll"), RTL_CONSTANT_STRING(L"sechost.dll"),
+    RTL_CONSTANT_STRING(L"rpcrt4.dll"), RTL_CONSTANT_STRING(L"PSAPI.DLL"),
+    RTL_CONSTANT_STRING(L"oleaut32.dll"), RTL_CONSTANT_STRING(L"ole32.dll"),
+    RTL_CONSTANT_STRING(L"NSI.dll"), RTL_CONSTANT_STRING(L"NORMALIZ.dll"),
+    RTL_CONSTANT_STRING(L"msvcrt.dll"), RTL_CONSTANT_STRING(L"MSCTF.dll"),
+    RTL_CONSTANT_STRING(L"kernel32.dll"), RTL_CONSTANT_STRING(L"imm32.dll"),
+    RTL_CONSTANT_STRING(L"IMAGEHLP.dll"), RTL_CONSTANT_STRING(L"gdiplus.dll"),
+    RTL_CONSTANT_STRING(L"gdi32.dll"), RTL_CONSTANT_STRING(L"difxapi.dll"),
+    RTL_CONSTANT_STRING(L"coml2.dll"), RTL_CONSTANT_STRING(L"comdlg32.dll"),
+    RTL_CONSTANT_STRING(L"combase.dll"), RTL_CONSTANT_STRING(L"appinfo.dll"),
+    RTL_CONSTANT_STRING(L"ntdll.dll"), RTL_CONSTANT_STRING(L"kernelbase.dll"),
+    RTL_CONSTANT_STRING(L"msvcp_win.dll"), RTL_CONSTANT_STRING(L"gdi32full.dll"),
+    RTL_CONSTANT_STRING(L"comctl32.dll"), RTL_CONSTANT_STRING(L"crypt32.dll"),
+    RTL_CONSTANT_STRING(L"bcrypt.dll"), RTL_CONSTANT_STRING(L"cfgmgr32.dll"),
+    RTL_CONSTANT_STRING(L"ucrtbase.dll"), RTL_CONSTANT_STRING(L"wintrust.dll"),
+    RTL_CONSTANT_STRING(L"version.dll"), RTL_CONSTANT_STRING(L"vcruntime140.dll"),
+    RTL_CONSTANT_STRING(L"vcruntime140_1.dll"), RTL_CONSTANT_STRING(L"userenv.dll"),
+    RTL_CONSTANT_STRING(L"profapi.dll"), RTL_CONSTANT_STRING(L"powrprof.dll"),
+    RTL_CONSTANT_STRING(L"hal.dll"), RTL_CONSTANT_STRING(L"ci.dll"),
+    RTL_CONSTANT_STRING(L"uxtheme.dll"), RTL_CONSTANT_STRING(L"dwmapi.dll"),
+    RTL_CONSTANT_STRING(L"rsaenh.dll"), RTL_CONSTANT_STRING(L"authz.dll"),
+    RTL_CONSTANT_STRING(L"dxgi.dll"), RTL_CONSTANT_STRING(L"d2d1.dll"),
+    RTL_CONSTANT_STRING(L"NetSetupEngine.dll"), RTL_CONSTANT_STRING(L"winnsi.dll"),
+    RTL_CONSTANT_STRING(L"kernel.appcore.dll"), RTL_CONSTANT_STRING(L"bcryptprimitives.dll"),
+    RTL_CONSTANT_STRING(L"umpdc.dll"), RTL_CONSTANT_STRING(L"win32u.dll"),
+    RTL_CONSTANT_STRING(L"cryptsp.dll"), RTL_CONSTANT_STRING(L"Windows.StateRepositoryCore.dll"),
+    RTL_CONSTANT_STRING(L"sspicli.dll"), RTL_CONSTANT_STRING(L"msasn1.dll"),
+    RTL_CONSTANT_STRING(L"dpapi.dll"), RTL_CONSTANT_STRING(L"winhttp.dll"),
+    RTL_CONSTANT_STRING(L"cryptbase.dll"), RTL_CONSTANT_STRING(L"WinTypes.dll"),
+    RTL_CONSTANT_STRING(L"CoreMessaging.dll"), RTL_CONSTANT_STRING(L"winmm.dll"),
+    RTL_CONSTANT_STRING(L"secur32.dll"), RTL_CONSTANT_STRING(L"ImplatSetup.dll")
+};
+
+#define EXE_WHITELIST_COUNT (sizeof(g_exe_Whitelist) / sizeof(UNICODE_STRING))
+#define DLL_WHITELIST_COUNT (sizeof(g_dll_WhiteList) / sizeof(UNICODE_STRING))
+
+#define MAGIC_NUMBER 0x5343414E
+
+typedef struct _REGISTRATION_PACKET {
+    HANDLE MonitorPid;
+    HANDLE ClamdPid;
+    HANDLE EventHandle;
+} REGISTRATION_PACKET, * PREGISTRATION_PACKET;
+
+typedef struct _KILLING_PID_ENTRY {
+    LIST_ENTRY ListEntry;
+    HANDLE ProcessId;
+} KILLING_PID_ENTRY, * PKILLING_PID_ENTRY;
+
+// Globais para o controle de quarentena
+LIST_ENTRY g_KillingPidsListHead;
+KSPIN_LOCK g_KillingPidsLock;
+
+// Algoritmo DJB2: Transforma uma string longa em um número de 4 bytes para busca rápida
+static ULONG HashString(PUNICODE_STRING String) {
+    ULONG hash = 5381;
+    if (!String || !String->Buffer) return 0;
+    for (USHORT i = 0; i < String->Length / sizeof(WCHAR); i++) {
+        WCHAR c = String->Buffer[i];
+        // Downcase manual apenas para A-Z (Seguro em qualquer IRQL)
+        if (c >= L'A' && c <= L'Z') c += (L'a' - L'A');
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash;
+}
+
+static BOOLEAN IsInIntegrityCache(PUNICODE_STRING FileName, LARGE_INTEGER WriteTime, LARGE_INTEGER FileSize) {
+    if (!FileName || !FileName->Buffer || FileName->Length == 0) return FALSE;
+
+    ULONG hash = HashString(FileName);
+    BOOLEAN found = FALSE;
+
+    KeEnterCriticalRegion(); // Obrigatório antes de adquirir ERESOURCE
+    ExAcquireResourceSharedLite(&g_CacheResource, TRUE);
+
+    PLIST_ENTRY entry = g_CacheListHead.Flink;
+    while (entry != &g_CacheListHead) {
+        PCACHE_ENTRY cache = CONTAINING_RECORD(entry, CACHE_ENTRY, ListEntry);
+        // Usamos os metadados passados diretamente pela Callback principal
+        if (cache->PathHash == hash &&
+            cache->FileSize.QuadPart == FileSize.QuadPart &&
+            cache->LastWriteTime.QuadPart == WriteTime.QuadPart) {
+            found = TRUE;
+            break;
+        }
+        entry = entry->Flink;
+    }
+    ExReleaseResourceLite(&g_CacheResource);
+    KeLeaveCriticalRegion(); // Obrigatório após liberar
+    return found;
+}
+
+// Centraliza a lógica FIFO
+static void AddToCache(ULONG hash, LARGE_INTEGER WriteTime, LARGE_INTEGER FileSize) {
+	BOOLEAN removedFromCache = FALSE;
+    BOOLEAN cannotAllocateCache = FALSE;
+    ULONG oldHash = 0;
+	ULONG oldCacheCount = g_CacheCount;
+
+    // se WriteTime e FileSize vier zerados nao salva no cache.
+    if (WriteTime.QuadPart == 0 && FileSize.QuadPart == 0) {
+        return;
+    }
+
+#   // Tenta alocar o novo item antes do spinlock para evitar bsod 
+    PCACHE_ENTRY newC = (PCACHE_ENTRY)Malloc(sizeof(CACHE_ENTRY), 'Cach');
+
+    KeEnterCriticalRegion();
+    ExAcquireResourceExclusiveLite(&g_CacheResource, TRUE);
+    
+	while (g_CacheCount >= g_MAX_CACHE_ENTRIES) {
+    // Lógica FIFO: Se atingir o limite definido, remove o mais antigo (Head)
+    //if (g_CacheCount >= g_MAX_CACHE_ENTRIES) {
+        PLIST_ENTRY oldEntry = RemoveHeadList(&g_CacheListHead);
+        PCACHE_ENTRY oldCache = CONTAINING_RECORD(oldEntry, CACHE_ENTRY, ListEntry);
+        oldHash = oldCache->PathHash;
+        ExFreePoolWithTag(oldCache, 'Cach');
+        g_CacheCount--;
+		removedFromCache = TRUE;
+    }
+
+    if (newC) {
+        RtlZeroMemory(newC, sizeof(*newC));
+        newC->PathHash = hash;
+        newC->LastWriteTime = WriteTime;
+        newC->FileSize = FileSize;
+        InsertTailList(&g_CacheListHead, &newC->ListEntry);
+        g_CacheCount++;
+    }
+    else {
+		cannotAllocateCache = TRUE;
+    }
+
+    ExReleaseResourceLite(&g_CacheResource);
+    KeLeaveCriticalRegion();
+
+    if (removedFromCache) {
+        DbgPrint("[SENTINELA] AddToCache: Cache cheio. Removendo %d item(s) antigo(s).\n", oldCacheCount - g_MAX_CACHE_ENTRIES);
+    }
+    if (cannotAllocateCache) {
+        DbgPrint("[SENTINELA] AddToCache ERRO: Não foi possível alocar memória para o cache.\n");
+    } 
+    else {
+        if (g_Debug) DbgPrint("[SENTINELA] AddToCache: Item adicionado ao Cache: %hu (Total: %d)\n", hash, g_CacheCount);
+    }
+    
+}
+
+// função para verificar a extensão
+static BOOLEAN IsExe(PUNICODE_STRING FileName) {
+    if (!FileName || FileName->Length == 0) return FALSE;
+
+    // Verifica se o FileName termina com essa extensão
+    if (FileName->Length >= g_exeExt.Length) {
+        // Calcula o ponteiro para o final da string original
+        UNICODE_STRING suffix;
+        suffix.Length = g_exeExt.Length;
+        suffix.MaximumLength = g_exeExt.Length;
+        suffix.Buffer = &FileName->Buffer[(FileName->Length - g_exeExt.Length) / sizeof(WCHAR)];
+
+        // Compara (TRUE para ignorar maiúsculas/minúsculas)
+        if (RtlSuffixUnicodeString(&g_exeExt, &suffix, TRUE)){
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+BOOLEAN IsInEXEWhitelist(PUNICODE_STRING FullImageName) {
+    if (!FullImageName || FullImageName->Length == 0) return FALSE;
+
+    // acessando o nome do arquivo sem o prefixNT
+    UNICODE_STRING PrefixoOk;
+    // checando se o tamanho do arquivo tem ao menos a quantidade de caracteres do prefixNT
+    if (FullImageName->Length >= prefixNT.Length) {
+        PrefixoOk.Buffer = &FullImageName->Buffer[prefixNT.Length / sizeof(WCHAR)];
+        PrefixoOk.Length = FullImageName->Length - prefixNT.Length;
+        PrefixoOk.MaximumLength = PrefixoOk.Length;
+    }
+    else {
+        DbgPrint("[SENTINELA] IsInEXEWhitelist: Erro - Nome de arquivo muito pequeno para conter o \\??\\, retornando falso: %wZ\n", FullImageName);
+        return FALSE;
+    }
+    for (ULONG i = 0; i < EXE_WHITELIST_COUNT; i++) {
+        // Verifica se FullImageName termina com o nome da DLL na whitelist
+        // TRUE para ignorar Case
+        if (RtlSuffixUnicodeString(&g_exe_Whitelist[i], &PrefixoOk, TRUE)) {
+            // verifique se antes da DLL vem o caminho da System32
+            if (RtlPrefixUnicodeString(&g_winSystem32Path, &PrefixoOk, TRUE)) {
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+BOOLEAN IsInDLLWhitelist(PUNICODE_STRING FullImageName) {
+    if (!FullImageName || FullImageName->Length == 0) return FALSE;
+
+    // acessando o nome do arquivo sem o prefixNT
+    UNICODE_STRING PrefixoOk;
+    // checando se o tamanho do arquivo tem ao menos a quantidade de caracteres do prefixNT
+    if (FullImageName->Length >= prefixNT.Length) {
+        PrefixoOk.Buffer = &FullImageName->Buffer[prefixNT.Length / sizeof(WCHAR)];
+        PrefixoOk.Length = FullImageName->Length - prefixNT.Length;
+        PrefixoOk.MaximumLength = PrefixoOk.Length;
+    }
+    else {
+        DbgPrint("[SENTINELA] IsInDLLWhitelist: Erro - Nome de arquivo muito pequeno para conter o \\??\\, retornando falso: %wZ\n", FullImageName);
+        return FALSE;
+	}
+    for (ULONG i = 0; i < DLL_WHITELIST_COUNT; i++) {
+        // Verifica se FullImageName termina com o nome da DLL na whitelist
+        // TRUE para ignorar Case
+        if (RtlSuffixUnicodeString(&g_dll_WhiteList[i], &PrefixoOk, TRUE)) {
+
+            // Opcional: Para segurança extra, verifique se antes da DLL vem o caminho da System32
+            if (RtlPrefixUnicodeString(&g_winSystem32Path, &PrefixoOk, TRUE)) {
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+static BOOLEAN IsMicrosoftTrusted(PUNICODE_STRING FullImagePath) {
+    if (!FullImagePath || !FullImagePath->Buffer || g_winSystem32Path.Length == 0) return FALSE;
+
+    if (IsExe(FullImagePath)) {
+        //if (g_Debug) DbgPrint("[SENTINELA] IsExe: Iniciando para: %wZ\n", FullImagePath);
+        // lista de processos protegidos por Protected Proccess Light (windows 8.1+)
+        if (IsInEXEWhitelist(FullImagePath)) {
+            //if (g_Debug) DbgPrint("[SENTINELA] IsExe: Aceitando processo PPL: %wZ\n", expectedPath);
+            return TRUE;
+        }
+    } else {
+        //if (g_Debug) DbgPrint("[SENTINELA] IsDLL: Iniciando para: %wZ\n", FullImagePath);
+		// lista de KnownDLLs (DLLs carregadas por processos protegidos e comuns)
+        if (IsInDLLWhitelist(FullImagePath)) {
+            //if (g_Debug) DbgPrint("[SENTINELA] IsDLL: Aceitando KnownDLL: %wZ\n", expectedPath);
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static NTSTATUS io_get_mtime_fsize(PUNICODE_STRING FileName, PLARGE_INTEGER mtime, PLARGE_INTEGER fsize) {
+    // 1. Preparando atributos do arquivo para checar o cache
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    HANDLE fileHandle = NULL;
+    OBJECT_ATTRIBUTES objAttr;
+    IO_STATUS_BLOCK ioStatus;
+    FILE_BASIC_INFORMATION basicInfo;
+    FILE_STANDARD_INFORMATION stdInfo;
+
+    // zera os valores de saída para evitar lixo de memória
+    mtime->QuadPart = 0;
+    fsize->QuadPart = 0;
+
+    // 1. Configura atributos (Sempre use OBJ_KERNEL_HANDLE por segurança)
+    InitializeObjectAttributes(&objAttr, FileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    // 2. Abre o arquivo (Apenas para ler atributos, não trava o arquivo para o usuário)
+    status = ZwOpenFile(&fileHandle,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        &objAttr, &ioStatus,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_SYNCHRONOUS_IO_NONALERT);
+    if (!NT_SUCCESS(status)) return status;
+
+    if (NT_SUCCESS(status)) {
+        // Obtém Data de Modificação Real
+        if (NT_SUCCESS(ZwQueryInformationFile(fileHandle, &ioStatus, &basicInfo, sizeof(basicInfo), FileBasicInformation))) {
+            *mtime = basicInfo.LastWriteTime;
+        }
+
+        // Obtém Tamanho Real
+        if (NT_SUCCESS(ZwQueryInformationFile(fileHandle, &ioStatus, &stdInfo, sizeof(stdInfo), FileStandardInformation))) {
+            *fsize = stdInfo.EndOfFile;
+        }
+
+        // Fecha o handle assim que termina a leitura
+        ZwClose(fileHandle);
+    }
+    return status;
+}
+
+BOOLEAN obtem_metadados_e_checa_cache(PUNICODE_STRING ImageFileName, LARGE_INTEGER &mtime, LARGE_INTEGER &fsize)
+{
+    NTSTATUS status = io_get_mtime_fsize(ImageFileName, &mtime, &fsize);
+
+    // Checa se todos os valores foram obtidos
+    // Se mtime ou fsize continuarem 0, algo falhou no I/O e o cache será pulado (Fail-Safe)
+    if (mtime.QuadPart != 0 && fsize.QuadPart != 0) {
+        //if (g_Debug) DbgPrint("[SENTINELA] obtem_metadados_e_checa_cache: Checando cache para %wZ...\n", ImageFileName);
+        // Checa o Cache. Se já foi aprovado nesta sessão, libera instantaneamente.
+        // Chama o cache normalmente com os valores validados
+        if (IsInIntegrityCache(ImageFileName, mtime, fsize)) {
+            return TRUE; // LIBERADO PELO CACHE
+        }
+        return FALSE;
+    }
+    // LOG DE ERRO: Indica que o cache foi pulado por falta de dados
+    DbgPrint("[SENTINELA] ERRO obtem_metadados_e_checa_cache: Erro obtentdo os metadados para %wZ (Status: 0x%08X). Pulando cache.\n",
+        ImageFileName, status);
+    return FALSE;
+}
+
+// Verifica se o PID já está marcado para morrer
+BOOLEAN IsPidInKillingList(HANDLE ProcessId) {
+    KIRQL oldIrql;
+    BOOLEAN encontrado = FALSE;
+    PLIST_ENTRY entry;
+
+    KeAcquireSpinLock(&g_KillingPidsLock, &oldIrql);
+    entry = g_KillingPidsListHead.Flink;
+    while (entry != &g_KillingPidsListHead) {
+        PKILLING_PID_ENTRY item = CONTAINING_RECORD(entry, KILLING_PID_ENTRY, ListEntry);
+        if (item->ProcessId == ProcessId) {
+            encontrado = TRUE;
+            break;
+        }
+        entry = entry->Flink;
+    }
+    KeReleaseSpinLock(&g_KillingPidsLock, oldIrql);
+    return encontrado;
+}
+
+// Adiciona um PID à lista de morte
+BOOLEAN AddPidToKillingList(HANDLE ProcessId) {
+    PKILLING_PID_ENTRY entry = (PKILLING_PID_ENTRY)Malloc(sizeof(KILLING_PID_ENTRY), 'Kill');
+    if (!entry) return FALSE;
+
+    entry->ProcessId = ProcessId;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_KillingPidsLock, &oldIrql);
+    InsertTailList(&g_KillingPidsListHead, &entry->ListEntry);
+    KeReleaseSpinLock(&g_KillingPidsLock, oldIrql);
+    return TRUE;
+}
+
+// Remove o PID da lista após o ZwTerminateProcess
+VOID RemovePidFromKillingList(HANDLE ProcessId) {
+    KIRQL oldIrql;
+    PLIST_ENTRY entry;
+
+    KeAcquireSpinLock(&g_KillingPidsLock, &oldIrql);
+    entry = g_KillingPidsListHead.Flink;
+    while (entry != &g_KillingPidsListHead) {
+        PKILLING_PID_ENTRY item = CONTAINING_RECORD(entry, KILLING_PID_ENTRY, ListEntry);
+        if (item->ProcessId == ProcessId) {
+            RemoveEntryList(&item->ListEntry);
+            ExFreePoolWithTag(item, 'Kill');
+            break;
+        }
+        entry = entry->Flink;
+    }
+    KeReleaseSpinLock(&g_KillingPidsLock, oldIrql);
+}
+
+// Libera o contexto de scan enviado ao Python
+VOID LimparScanContext(PSCAN_CONTEXT ctx) {
+    if (ctx) {
+        // Se houver algum buffer interno no 'Scan', libere aqui.
+        // Se for apenas a struct:
+        ExFreePoolWithTag(ctx, 'Scan');
+    }
+}
+
+// Libera o contexto de resposta onde a thread fica esperando
+VOID LimparScanResponseQueue(PSCAN_RESPONSE_QUEUE ctx_resp) {
+    if (ctx_resp) {
+        // 1. Libera o buffer da string de caminho (alocado em CriarContextoScanResponse)
+        if (ctx_resp->FileName.Buffer) {
+            ExFreePoolWithTag(ctx_resp->FileName.Buffer, 'Name');
+            ctx_resp->FileName.Buffer = NULL;
+        }
+
+        // 2. Libera a estrutura principal
+        ExFreePoolWithTag(ctx_resp, 'Resp');
+    }
+}
+
+BOOLEAN wait_verdict_event_and_cleanup(PSCAN_CONTEXT ctx_scan, PSCAN_RESPONSE_QUEUE ctx_scan_response, HANDLE currentPid)
+{
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -10000000 * g_TEMPO_TIMEOUT; // 10s
+
+    // 1. Primeiro Wait (Normal ou Timeout)
+    NTSTATUS wait = KeWaitForSingleObject(
+        &ctx_scan_response->ResponseEvent,
+        Executive,
+        KernelMode,
+        FALSE,
+        &timeout
+    );
+
+    // ... logo após o KeWaitForSingleObject ...
+	// checa se o pid esta na lista da morte e se estiver, congela a thread para evitar que o processo malicioso faça algo antes de ser morto
+    if (IsPidInKillingList(currentPid)) {
+        DbgPrint("[SENTINELA] Pós-Wait: PID %p em quarentena. Congelando.\n", currentPid);
+        KIRQL lockIrql;
+        KeAcquireSpinLock(&g_GlobalLock, &lockIrql);
+
+        // 1. Removemos da lista AGORA para o Unload não tentar mexer aqui
+        if (ctx_scan_response->ListEntry.Flink != &ctx_scan_response->ListEntry &&
+            ctx_scan_response->ListEntry.Flink != NULL) {
+            RemoveEntryList(&ctx_scan_response->ListEntry);
+            InitializeListHead(&ctx_scan_response->ListEntry);
+
+            if (ctx_scan->ListEntry.Flink != &ctx_scan->ListEntry &&
+                ctx_scan->ListEntry.Flink != NULL) {
+                RemoveEntryList(&ctx_scan->ListEntry);
+                InitializeListHead(&ctx_scan->ListEntry);
+            }
+        }
+        KeReleaseSpinLock(&g_GlobalLock, lockIrql);
+
+        // 2. Liberamos a memória antes do congelamento eterno
+        LimparScanContext(ctx_scan);
+        LimparScanResponseQueue(ctx_scan_response);
+
+        // 3. Congelamento Absoluto
+        KEVENT EventoZumbi;
+        KeInitializeEvent(&EventoZumbi, NotificationEvent, FALSE);
+        KeWaitForSingleObject(&EventoZumbi, Executive, KernelMode, FALSE, NULL);
+        return FALSE;
+    }
+
+    KIRQL oldIrql;
+    // tentando obter o lock o mais rapido possivel
+    KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+
+    // checa se estamos em timeout
+    if (wait == STATUS_TIMEOUT) {
+
+		// checa se o magic number ainda esta presente, se estiver, significa que o python realmente nao respondeu a tempo e podemos marcar o veredito como timeout ou liberar para tirar bugs
+        if (ctx_scan_response->StillAlive == MAGIC_NUMBER) {
+            // marcando magic como consumido
+            ctx_scan_response->StillAlive = 0;
+			// incrementa contador de timeouts para monitoramento
+			InterlockedIncrement(&g_contador_timeouts);
+            if (g_fail_close) {
+                DbgPrint("[SENTINELA] wait_event_and_cleanup: Processo bloqueado por timeout (Fail-close): %p %wZ\n", ctx_scan_response->ProcessId, ctx_scan_response->FileName);
+                ctx_scan_response->Status = STATUS_TIMEOUT;
+            }
+            else
+            {
+                DbgPrint("[SENTINELA] wait_event_and_cleanup: Timeout de processo, liberando (Fail-Open) para tirar bugs: %p %wZ\n", ctx_scan_response->ProcessId, ctx_scan_response->FileName);
+                ctx_scan_response->Status = STATUS_SUCCESS; // Sua regra para tirar bugs
+            }
+        }
+    } 
+
+    // hora da limpeza mandatoria, independente de ter dado timeout a limpeza eh sempre conosco
+    // checando integridade de ctx_scan_response e retirando da lista
+    if (ctx_scan_response->ListEntry.Flink != &ctx_scan_response->ListEntry &&
+        ctx_scan_response->ListEntry.Flink != NULL) {
+
+        RemoveEntryList(&ctx_scan_response->ListEntry);
+        InitializeListHead(&ctx_scan_response->ListEntry);
+
+        // se ctx_scan ainda estiver na lista tenta retirar o contexto de scan
+        if (ctx_scan->ListEntry.Flink != &ctx_scan->ListEntry &&
+            ctx_scan->ListEntry.Flink != NULL) {
+            RemoveEntryList(&ctx_scan->ListEntry);
+            InitializeListHead(&ctx_scan->ListEntry);
+        }
+
+    }
+    
+    KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+
+    // aqui o veredito ja foi setado (por um verdict ou pelo timeout acima)
+    // 5. VEREDITO FINAL
+    // a queue ja foi libearada, decrementa apenas aqui.
+    InterlockedDecrement(&g_QueueCount);
+
+    return NT_SUCCESS(ctx_scan_response->Status);
+}
+
+PSCAN_CONTEXT CriarContextoScan(PSCAN_RESPONSE_QUEUE Response, HANDLE ProcessId, PVOID* dump, ULONG dump_size) {
+    // 1. Aloca a estrutura principal
+    PSCAN_CONTEXT ctx_scan = (PSCAN_CONTEXT)Malloc(sizeof(SCAN_CONTEXT), 'Scan');
+    if (!ctx_scan) {
+        DbgPrint("[SENTINELA] ERRO CriarContexto: Não foi possível alocar memória para o contexto de espera.\n");
+        if (g_Debug) DbgPrint("[SENTINELA] retornando contexto nulo...");
+        return NULL;
+    }
+
+    // PRIMEIRO: Limpa a memória para evitar lixo
+    RtlZeroMemory(ctx_scan, sizeof(SCAN_CONTEXT));
+
+    // 3. Preenche os metadados
+    ctx_scan->ProcessId = ProcessId;
+
+    // aponta pro buffer do nome em ctx_scan_response
+    // 4. Copia o ponteiro do nome de arquivo (Alocação separada para o buffer da string)
+    ctx_scan->ResponseContext = Response;
+
+    // O campo PEDUMP é opcional e se preenchido sera enviado apos o nome de arquivo o get_item.
+    if (dump) {
+        ctx_scan->PEDUMP = dump;
+		ctx_scan->PEDUMP_Length = dump_size;
+    }
+    else {
+        ctx_scan->PEDUMP = NULL;
+		ctx_scan->PEDUMP_Length = 0;
+    }
+
+    return ctx_scan;
+}
+
+PSCAN_RESPONSE_QUEUE CriarContextoScanResponse(PUNICODE_STRING FileName, HANDLE ProcessId, LARGE_INTEGER fileDate, LARGE_INTEGER fileSize) {
+    // 1. Aloca a estrutura principal
+    PSCAN_RESPONSE_QUEUE ctx_scan_response = (PSCAN_RESPONSE_QUEUE)Malloc(sizeof(SCAN_RESPONSE_QUEUE), 'Resp');
+    if (!ctx_scan_response) {
+        DbgPrint("[SENTINELA] ERRO CriarContextoFileData: Não foi possível alocar memória para o contexto de espera.\n");
+        if (g_Debug) DbgPrint("[SENTINELA] retornando contexto nulo...");
+        return NULL;
+    }
+
+    // PRIMEIRO: Limpa a memória para evitar lixo
+    RtlZeroMemory(ctx_scan_response, sizeof(SCAN_RESPONSE_QUEUE));
+    // ligando buffer de nome ao contexto de scan
+    // seta o tamanho do arquivo como vazio para evitar lixo de memória
+    ctx_scan_response->FileName.Length = 0;
+    ctx_scan_response->FileName.MaximumLength = FileName->Length + sizeof(WCHAR);
+    ctx_scan_response->FileName.Buffer = (PWCH)Malloc(ctx_scan_response->FileName.MaximumLength, 'Name');
+    if (!ctx_scan_response->FileName.Buffer) {
+        // Se falhar em alocar o buffer para o nome, limpa a estrutura e aborta
+        ExFreePoolWithTag(ctx_scan_response, 'Resp');
+        DbgPrint("[SENTINELA] ERRO CriarContexto: Não foi possível alocar memória para o nome do arquivo.\n");
+        if (g_Debug) DbgPrint("[SENTINELA] retornando contexto nulo...");
+        return NULL;
+    }
+    // Copia o nome do arquivo
+    RtlCopyUnicodeString(&ctx_scan_response->FileName, FileName);
+
+    // Preenche os metadados
+    ctx_scan_response->ProcessId = ProcessId;
+    // Padrão: Bloqueado (Zero-Trust)
+    // inicializa o campo Status como DEVICE_BUSY, ja que se houver um time out esse status confirma
+    // que foi rejeitado pq nao foi possivel avaliar no tempo alocado
+    ctx_scan_response->Status = STATUS_DEVICE_BUSY; 
+    ctx_scan_response->MTime = fileDate;
+    ctx_scan_response->FSize = fileSize;
+    ctx_scan_response->StillAlive = MAGIC_NUMBER;
+    // 2. Inicializa o Evento (Crucial para o KeWaitForSingleObject)
+    // SynchronizationEvent = Auto-reset (volta ao estado não-sinalizado após acordar uma thread)
+    KeInitializeEvent(&ctx_scan_response->ResponseEvent, SynchronizationEvent, FALSE);
+    return ctx_scan_response;
+}
+
+void envia_ctx_scan_para_fila(PSCAN_CONTEXT ctx_scan)
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+    InsertTailList(&g_ScanQueueHead, &ctx_scan->ListEntry);
+
+    // sinaliza ao python que tem um item novo na fila (o Python vai ler a fila, processar o item e dar o veredito)
+    if (NT_SUCCESS(KeSetEvent(g_MonitorEvent, IO_NO_INCREMENT, FALSE))) {
+        if (g_Debug) DbgPrint("[SENTINELA] envia_ctx_scan_para_fila: Sinalizando contexto adicionado na fila de espera.\n");
+    }
+
+    KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+
+}
+
+void guardar_ctx_scan_response(PSCAN_RESPONSE_QUEUE ctx_scan_response)
+{
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+    InsertTailList(&g_ScanResponseQueueHead, &ctx_scan_response->ListEntry);
+    KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+    if (g_Debug) DbgPrint("[SENTINELA] guardar_ctx_file: Contexto de dados do arquivo armazenado para PID %lu.\n", HandleToULong(ctx_scan_response->ProcessId));
+}
+
+VOID LiberarResponseQueueGeral() {
+    KIRQL oldIrql;
+    PLIST_ENTRY entry, nextEntry;
+
+    // 1. Pegamos o lock para ninguém mexer nas listas enquanto limpamos
+    KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+
+    // Liberar as threads presas no Wait (Fila de Resposta) ---
+    entry = g_ScanResponseQueueHead.Flink;
+    while (entry != &g_ScanResponseQueueHead) {
+        nextEntry = entry->Flink;
+        PSCAN_RESPONSE_QUEUE ctx_resp = CONTAINING_RECORD(entry, SCAN_RESPONSE_QUEUE, ListEntry);
+
+        // Se a thread ainda está esperando (StillAlive)
+        if (ctx_resp->StillAlive == MAGIC_NUMBER) {
+            ctx_resp->StillAlive = 0;
+
+            // Bypass: Como o Python caiu, liberamos o acesso (Fail-Open)
+            ctx_resp->Status = STATUS_SUCCESS;
+
+            // ACORDA A THREAD IMEDIATAMENTE (evita o timeout)
+            KeSetEvent(&ctx_resp->ResponseEvent, IO_NO_INCREMENT, FALSE);
+        }
+        entry = nextEntry;
+    }
+
+    // Como as filas estão vazias, o saldo de pendências volta a zero
+    InterlockedExchange(&g_QueueCount, 0);
+
+    KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+
+    DbgPrint("[SENTINELA] Limpeza Geral: Filas esvaziadas e threads liberadas.\n");
+}
+
+FORCEINLINE BOOLEAN IsMonitoramentoSaudavel() {
+    // 1. Se não há evento ou o bypass foi acionado, libera
+    if (g_MonitorEvent == NULL || InterlockedOr(&g_PythonActive, 0) == 0) {
+        return FALSE;
+    }
+
+    // 2. DISJUNTOR: Se a fila estourou, o Python travou.
+    if (InterlockedCompareExchange(&g_QueueCount, 0, 0) > g_QUEUE_MAX_THRESHOLD) {
+        DbgPrint("[SENTINELA] FATAL: Fila saturada (%d). Desativando e liberando threads.\n", g_QueueCount);
+        InterlockedExchange(&g_PythonActive, 0);
+
+        // Limpa tudo agora para as threads não darem Fail-Closed por timeout
+        LiberarResponseQueueGeral();
+        return FALSE;
+    }
+    return TRUE;
+}
+
+VOID CancelarResponseQueuePorProcesso(HANDLE pidToKill) {
+    KIRQL oldIrql;
+    PLIST_ENTRY entry, nextEntry;
+
+    KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+
+    // Limpa Fila do Python ('Scan')
+    entry = g_ScanQueueHead.Flink;
+    while (entry != &g_ScanQueueHead) {
+        nextEntry = entry->Flink;
+        PSCAN_CONTEXT ctx_scan = CONTAINING_RECORD(entry, SCAN_CONTEXT, ListEntry);
+        if (ctx_scan->ProcessId == pidToKill) {
+            RemoveEntryList(&ctx_scan->ListEntry);
+            InitializeListHead(&ctx_scan->ListEntry);
+            ExFreePoolWithTag(ctx_scan, 'Scan');
+        }
+        entry = nextEntry;
+    }
+
+    // Limpa Fila de Resposta ('Resp' e 'Name') - zumbificando as threads 
+    entry = g_ScanResponseQueueHead.Flink;
+    while (entry != &g_ScanResponseQueueHead) {
+        nextEntry = entry->Flink;
+        PSCAN_RESPONSE_QUEUE ctx_resp = CONTAINING_RECORD(entry, SCAN_RESPONSE_QUEUE, ListEntry);
+
+        // Na PARTE B de CancelarResponseQueuePorProcesso:
+        if (ctx_resp->ProcessId == pidToKill && ctx_resp->StillAlive == MAGIC_NUMBER) {
+            ctx_resp->StillAlive = 0; // Invalida o Magic Number
+            ctx_resp->Status = STATUS_CANCELLED;
+
+            // SINALIZA: A thread acordará, cairá no "Filtro Pós-Wait" 
+            // removerá a si mesma da lista e dará o Free com segurança.
+            KeSetEvent(&ctx_resp->ResponseEvent, IO_NO_INCREMENT, FALSE);
+        }
+        entry = nextEntry;
+    }
+    KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+}
+
+// Protótipo para cópia de memória entre processos
+extern "C" NTSTATUS MmCopyVirtualMemory(
+    PEPROCESS SourceProcess,
+    PVOID SourceAddress,
+    PEPROCESS TargetProcess,
+    PVOID TargetAddress,
+    SIZE_T BufferSize,
+    KPROCESSOR_MODE PreviousMode,
+    PSIZE_T ReturnSize
+);
+
+typedef struct _PE_DUMP_RESULTS {
+    PVOID Buffer;
+    SIZE_T Size;
+} PE_DUMP_RESULTS;
+
+// Protótipo necessário (exportado pelo ntoskrnl.exe)
+// NTKERNELAPI PVOID NTAPI PsGetProcessSectionBaseAddress(PEPROCESS Process);
+extern "C" {
+    // Forçamos a declaração usando o tipo que o ntoskrnl.lib espera
+    NTKERNELAPI PVOID NTAPI PsGetProcessSectionBaseAddress(PEPROCESS Process);
+}
+
+SIZE_T GetImageSizeManual(PEPROCESS Process) {
+    PVOID base = PsGetProcessSectionBaseAddress(Process);
+    if (!base) return 0;
+
+    IMAGE_DOS_HEADER dos;
+    SIZE_T copiado = 0;
+
+    // 1. Ler cabeçalho DOS
+    NTSTATUS status = MmCopyVirtualMemory(Process, base, PsGetCurrentProcess(), &dos, sizeof(dos), KernelMode, &copiado);
+    if (!NT_SUCCESS(status) || dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+    // 2. Ler cabeçalho NT (usamos uma estrutura local para não apontar para o vácuo)
+    IMAGE_NT_HEADERS nt;
+    status = MmCopyVirtualMemory(Process, (PUCHAR)base + dos.e_lfanew, PsGetCurrentProcess(), &nt, sizeof(nt), KernelMode, &copiado);
+    if (!NT_SUCCESS(status) || nt.Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    return (SIZE_T)nt.OptionalHeader.SizeOfImage;
+}
+/*
+// 1. TRADUTOR VA -> RAW (C Puro)
+unsigned __int64 TraduzirVAparaRaw(PIMAGE_NT_HEADERS nt, unsigned int va) {
+    if (va < nt->OptionalHeader.SizeOfHeaders) {
+        return (unsigned __int64)va;
+    }
+
+    PIMAGE_SECTION_HEADER section = (PIMAGE_SECTION_HEADER)((unsigned char*)nt + sizeof(unsigned int) + sizeof(IMAGE_FILE_HEADER) + nt->FileHeader.SizeOfOptionalHeader);
+
+    for (unsigned short i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (va >= section[i].VirtualAddress && va < (section[i].VirtualAddress + section[i].Misc.VirtualSize)) {
+            unsigned __int64 offset = (unsigned __int64)(va - section[i].VirtualAddress);
+            if (offset < section[i].SizeOfRawData) {
+                return (unsigned __int64)(section[i].PointerToRawData + offset);
+            }
+        }
+    }
+    return 0;
+}
+
+// 2. RECONSTRUTOR (Foco nos 3 blocos de defeito)
+NTSTATUS ReconstruirPE(void* ImageBase, PE_DUMP_RESULTS* Results) {
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)ImageBase;
+        PIMAGE_NT_HEADERS ntRam = (PIMAGE_NT_HEADERS)((unsigned char*)ImageBase + dos->e_lfanew);
+
+        // --- CÁLCULO DO DELTA REAL (IAT ANCHOR) ---
+        unsigned __int64 imageBaseOriginal = ntRam->OptionalHeader.ImageBase;
+        unsigned __int64 delta = imageBaseOriginal - 0x140000000;
+
+        
+        PIMAGE_DATA_DIRECTORY impDir = &ntRam->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        /*
+        if (impDir->VirtualAddress) {
+            PIMAGE_IMPORT_DESCRIPTOR impDesc = (PIMAGE_IMPORT_DESCRIPTOR)((unsigned char*)ImageBase + impDir->VirtualAddress);
+            if (impDesc->OriginalFirstThunk && impDesc->FirstThunk) {
+                PIMAGE_THUNK_DATA thunkILT = (PIMAGE_THUNK_DATA)((unsigned char*)ImageBase + impDesc->OriginalFirstThunk);
+                PIMAGE_THUNK_DATA thunkIAT = (PIMAGE_THUNK_DATA)((unsigned char*)ImageBase + impDesc->FirstThunk);
+
+                if (thunkILT->u1.AddressOfData && thunkIAT->u1.AddressOfData) {
+                    // Delta = Endereço_RAM - (RVA + ImageBase_do_Header)
+                    delta = thunkIAT->u1.AddressOfData - (thunkILT->u1.AddressOfData + imageBaseOriginal);
+                }
+            }
+        }*/
+/*
+        // --- PREPARAÇÃO DO BUFFER ---
+        PIMAGE_SECTION_HEADER secTabela = (PIMAGE_SECTION_HEADER)((unsigned char*)ntRam + sizeof(unsigned int) + sizeof(IMAGE_FILE_HEADER) + ntRam->FileHeader.SizeOfOptionalHeader);
+        PIMAGE_SECTION_HEADER ultima = &secTabela[ntRam->FileHeader.NumberOfSections - 1];
+        size_t tamanhoDisco = (size_t)(ultima->PointerToRawData + ultima->SizeOfRawData);
+
+        void* buf = Malloc(tamanhoDisco, 'dump');
+        if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+        RtlZeroMemory(buf, tamanhoDisco);
+
+        // Unmapping (Cópia Header e Seções)
+        RtlCopyMemory(buf, ImageBase, ntRam->OptionalHeader.SizeOfHeaders);
+        for (unsigned short i = 0; i < ntRam->FileHeader.NumberOfSections; i++) {
+            if (secTabela[i].PointerToRawData) {
+                RtlCopyMemory((unsigned char*)buf + secTabela[i].PointerToRawData, (unsigned char*)ImageBase + secTabela[i].VirtualAddress, secTabela[i].SizeOfRawData);
+            }
+        }
+
+        PIMAGE_NT_HEADERS ntBuf = (PIMAGE_NT_HEADERS)((unsigned char*)buf + dos->e_lfanew);
+
+        // CORREÇÃO 1: ImageBase (0x130)
+        // Forçamos o ImageBase original no cabeçalho do arquivo final
+        ntBuf->OptionalHeader.ImageBase = 0x140000000;
+
+        // CORREÇÃO 2: IAT (0x24A00 - 0x251DE)
+        if (impDir->VirtualAddress) {
+            unsigned __int64 impRaw = TraduzirVAparaRaw(ntBuf, impDir->VirtualAddress);
+            PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)((unsigned char*)buf + impRaw);
+            while (imp->Name) {
+                unsigned __int64 iltR = TraduzirVAparaRaw(ntBuf, imp->OriginalFirstThunk);
+                unsigned __int64 iatR = TraduzirVAparaRaw(ntBuf, imp->FirstThunk);
+                if (iltR && iatR) {
+                    PIMAGE_THUNK_DATA tSrc = (PIMAGE_THUNK_DATA)((unsigned char*)buf + iltR);
+                    PIMAGE_THUNK_DATA tDst = (PIMAGE_THUNK_DATA)((unsigned char*)buf + iatR);
+                    while (tSrc->u1.AddressOfData) {
+                        tDst->u1.AddressOfData = tSrc->u1.AddressOfData;
+                        tSrc++; tDst++;
+                    }
+                }
+                imp++;
+            }
+        }
+
+        // CORREÇÃO 3: Relocações (Bloco 0x2FE00 e outros)
+        PIMAGE_DATA_DIRECTORY relDir = &ntBuf->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if (relDir->VirtualAddress && delta != 0) {
+            PIMAGE_BASE_RELOCATION rel = (PIMAGE_BASE_RELOCATION)((unsigned char*)ImageBase + relDir->VirtualAddress);
+            while (rel->SizeOfBlock > 0) {
+                unsigned short* entry = (unsigned short*)((unsigned char*)rel + sizeof(IMAGE_BASE_RELOCATION));
+                for (unsigned int j = 0; j < (rel->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2; j++) {
+                    if ((entry[j] >> 12) == IMAGE_REL_BASED_DIR64) {
+                        unsigned int va = rel->VirtualAddress + (entry[j] & 0xFFF);
+                        unsigned __int64 raw = TraduzirVAparaRaw(ntBuf, va);
+                        if (raw) {
+                            *(unsigned __int64*)((unsigned char*)buf + raw) -= delta;
+                        }
+                    }
+                }
+                rel = (PIMAGE_BASE_RELOCATION)((unsigned char*)rel + rel->SizeOfBlock);
+            }
+        }
+
+        Results->Buffer = buf;
+        Results->Size = tamanhoDisco;
+        return STATUS_SUCCESS;
+
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return STATUS_ACCESS_VIOLATION; }
+}*/
+
+
+NTSTATUS ReconstruirPE(void* ImageBase, PE_DUMP_RESULTS* Results) {
+
+    __try {
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)ImageBase;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return STATUS_INVALID_IMAGE_FORMAT;
+
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((unsigned char*)ImageBase + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return STATUS_INVALID_IMAGE_FORMAT;
+
+        // 1. Localiza a tabela de seções
+        PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(nt);
+
+        // 2. Calcula o tamanho total do arquivo no disco baseado na última seção
+        PIMAGE_SECTION_HEADER ultima = &section[nt->FileHeader.NumberOfSections - 1];
+        size_t tamanhoArquivo = (size_t)(ultima->PointerToRawData + ultima->SizeOfRawData);
+
+        // 3. Aloca o buffer para o arquivo final
+        void* buf = Malloc(tamanhoArquivo, 'dump');
+        if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+        RtlZeroMemory(buf, tamanhoArquivo);
+
+        // 4. COPIA OS HEADERS (Puro, como estão na RAM)
+        RtlCopyMemory(buf, ImageBase, nt->OptionalHeader.SizeOfHeaders);
+
+        // 5. COPIA AS SEÇÕES (Transformando Virtual em Raw)
+        for (unsigned short i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+            if (section[i].PointerToRawData != 0 && section[i].SizeOfRawData != 0) {
+                // Copia da RAM (VirtualAddress) para o local de DISCO (PointerToRawData)
+                RtlCopyMemory(
+                    (unsigned char*)buf + section[i].PointerToRawData,
+                    (unsigned char*)ImageBase + section[i].VirtualAddress,
+                    section[i].SizeOfRawData
+                );
+            }
+        }
+
+        Results->Buffer = buf;
+        Results->Size = tamanhoArquivo;
+        return STATUS_SUCCESS;
+
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return STATUS_ACCESS_VIOLATION;
+    }
+}
+
+// Protótipo para resolver o identificador não definido
+NTKERNELAPI
+NTSTATUS
+NTAPI
+PsLookupProcessByProcessId(
+    _In_ HANDLE ProcessId,
+    _Outptr_ PEPROCESS* Process
+);
+
+// Lembre-se de declarar também o IoFileObjectType se for usar o ObReferenceObjectByHandle
+extern POBJECT_TYPE* IoFileObjectType;
+
+NTSTATUS DumpProcessoAtivoPorPEPROCESS(PEPROCESS ProcessoAlvo, PVOID* OutBuffer, PSIZE_T OutSize) {
+    // 2. Obter o ImageBase do processo
+    // Usamos aquela função que declaramos antes
+    PVOID BaseEndereço = PsGetProcessSectionBaseAddress(ProcessoAlvo);
+    if (BaseEndereço == NULL) {
+        ObDereferenceObject(ProcessoAlvo);
+        return STATUS_NOT_FOUND;
+    }
+
+    // 3. Obter o tamanho da imagem (Lendo o Header PE via MmCopyVirtualMemory)
+    SIZE_T tamanhoImagem = GetImageSizeManual(ProcessoAlvo);
+    if (tamanhoImagem == 0) {
+        ObDereferenceObject(ProcessoAlvo);
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    // 4. Alocar buffer temporário para o Dump Bruto (RAM)
+    PVOID bufferBruto = Malloc(tamanhoImagem, 'tmp');
+    if (!bufferBruto) {
+        ObDereferenceObject(ProcessoAlvo);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // 5. "Roubar" a memória do processo ativo
+    SIZE_T copiado = 0;
+    NTSTATUS status = MmCopyVirtualMemory(
+        ProcessoAlvo,
+        BaseEndereço,
+        PsGetCurrentProcess(),
+        bufferBruto,
+        tamanhoImagem,
+        KernelMode,
+        &copiado
+    );
+
+    if (NT_SUCCESS(status)) {
+        PE_DUMP_RESULTS final;
+        // 6. Usar seu Pipeline Mestre de Reconstrução
+        status = ReconstruirPE(bufferBruto, &final);
+        if (NT_SUCCESS(status)) {
+            *OutBuffer = final.Buffer;
+            *OutSize = final.Size;
+        }
+    }
+
+    // Limpeza
+    ExFreePoolWithTag(bufferBruto, 'tmp');
+    ObDereferenceObject(ProcessoAlvo);
+
+    return status;
+}
+
+NTSTATUS DumpProcessoAtivoPorPID(HANDLE ProcessId, PVOID* OutBuffer, PSIZE_T OutSize) {
+    PEPROCESS ProcessoAlvo = NULL;
+    NTSTATUS status;
+
+    // 1. Localizar o Objeto do Processo pelo PID
+    status = PsLookupProcessByProcessId(ProcessId, &ProcessoAlvo);
+    if (!NT_SUCCESS(status)) return status;
+
+	DbgPrint("[SENTINELA] DumpProcessoAtivoPorPID: Processo encontrado para PID %lu. Iniciando dump...\n", HandleToULong(ProcessId));
+	return DumpProcessoAtivoPorPEPROCESS(ProcessoAlvo, OutBuffer, OutSize);
+}
+
+// --- Estruturas Necessárias para percorrer a PEB ---
+
+typedef struct _PEB_LDR_DATA {
+    ULONG Length;
+    BOOLEAN Initialized;
+    HANDLE SsHandle;
+    LIST_ENTRY InLoadOrderModuleList;
+    LIST_ENTRY InMemoryOrderModuleList;
+    LIST_ENTRY InInitializationOrderModuleList;
+} PEB_LDR_DATA, * PPEB_LDR_DATA;
+
+#pragma warning(disable:4201) // Desabilita o aviso de struct/union sem nome
+typedef struct _PEB {
+    BOOLEAN InheritedAddressSpace;
+    BOOLEAN ReadImageFileExecOptions;
+    BOOLEAN BeingDebugged;
+    union {
+        BOOLEAN BitField;
+        struct {
+            BOOLEAN ImageUsesLargePages : 1;
+            BOOLEAN IsProtectedProcess : 1;
+            BOOLEAN IsImageDynamicallyRelocated : 1;
+            BOOLEAN SkipPatchingLocals : 1;
+            BOOLEAN IsPackagedProcess : 1;
+            BOOLEAN IsAppContainer : 1;
+            BOOLEAN IsProtectedProcessLight : 1;
+            BOOLEAN IsLongPathAwareProcess : 1;
+        };
+    };
+    PVOID Mutant;
+    PVOID ImageBaseAddress;
+    PPEB_LDR_DATA Ldr;
+} PEB, * PPEB;
+#pragma warning(disable:4201) // Desabilita o aviso de struct/union sem nome
+
+typedef struct _LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+} LDR_DATA_TABLE_ENTRY, * PLDR_DATA_TABLE_ENTRY;
+
+// --- Declaração de funções não exportadas por padrão ---
+
+extern "C" NTKERNELAPI PPEB NTAPI PsGetProcessPeb(PEPROCESS Process);
+
+// --- Implementação Refatorada ---
+
+PVOID GetModuleBaseAddress(PEPROCESS Process, PUNICODE_STRING DllName, PSIZE_T OutSize) {
+    KAPC_STATE apcState;
+    PVOID baseAddress = NULL;
+
+    // 1. Obtém a PEB do processo
+    PPEB peb = PsGetProcessPeb(Process);
+    if (!peb) return NULL;
+
+    // 2. Anexa ao contexto de memória do processo alvo
+    KeStackAttachProcess(Process, &apcState);
+
+    __try {
+        // 3. Verifica se a lista de módulos (Ldr) está carregada
+        if (peb->Ldr) {
+            PLIST_ENTRY listHead = &peb->Ldr->InLoadOrderModuleList;
+            PLIST_ENTRY it = listHead->Flink;
+
+            // 4. Percorre a lista duplamente ligada de DLLs
+            while (it != listHead) {
+                PLDR_DATA_TABLE_ENTRY entry = CONTAINING_RECORD(it, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+
+                // 5. Compara o nome da DLL (Case Insensitive)
+                if (RtlCompareUnicodeString(&entry->BaseDllName, DllName, TRUE) == 0) {
+                    baseAddress = entry->DllBase;
+                    if (OutSize) *OutSize = (SIZE_T)entry->SizeOfImage;
+                    break;
+                }
+                it = it->Flink;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[ERRO] Falha ao acessar PEB do processo.\n");
+        baseAddress = NULL;
+    }
+
+    // 6. Restaura o contexto do kernel
+    KeUnstackDetachProcess(&apcState);
+
+    return baseAddress;
+}
+
+NTSTATUS DumpDllPorNome(HANDLE PID, PCWSTR NomeDll, PVOID* OutBuffer, PSIZE_T OutSize) {
+    PEPROCESS ProcessoAlvo = NULL;
+    NTSTATUS status = PsLookupProcessByProcessId(PID, &ProcessoAlvo);
+    if (!NT_SUCCESS(status)) return status;
+
+    UNICODE_STRING usDllName;
+    RtlInitUnicodeString(&usDllName, NomeDll);
+
+    // 1. Encontra a DLL e o tamanho dela na RAM
+    SIZE_T tamanhoImagem = 0;
+    PVOID dllBase = GetModuleBaseAddress(ProcessoAlvo, &usDllName, &tamanhoImagem);
+
+    if (!dllBase || tamanhoImagem == 0) {
+        ObDereferenceObject(ProcessoAlvo);
+        return STATUS_NOT_FOUND;
+    }
+
+    // 2. Aloca buffer para cópia bruta (Virtual)
+    PVOID bufferBruto = Malloc(tamanhoImagem, 'tmpd');
+    if (!bufferBruto) {
+        ObDereferenceObject(ProcessoAlvo);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // 3. Copia a memória da DLL do processo alvo para o nosso driver
+    SIZE_T copiado = 0;
+    status = MmCopyVirtualMemory(
+        ProcessoAlvo,
+        dllBase,
+        PsGetCurrentProcess(),
+        bufferBruto,
+        tamanhoImagem,
+        KernelMode,
+        &copiado
+    );
+
+    if (NT_SUCCESS(status)) {
+        PE_DUMP_RESULTS final;
+        // 4. Reutiliza sua função de reconstrução de seções
+        status = ReconstruirPE(bufferBruto, &final);
+        if (NT_SUCCESS(status)) {
+            *OutBuffer = final.Buffer;
+            *OutSize = final.Size;
+        }
+    }
+
+    ExFreePoolWithTag(bufferBruto, 'tmpd');
+    ObDereferenceObject(ProcessoAlvo);
+    return status;
+}
+
+/*
+BOOLEAN checa_evasao_dll(PUNICODE_STRING FullImageName) {
+    BOOLEAN detectado = FALSE;
+    PLIST_ENTRY it;
+
+    KeAcquireGuardedMutex(&g_ListMutex);
+
+    it = g_TrackedDllList.Flink;
+    while (it != &g_TrackedDllList) {
+        PTRACKED_DLL entry = CONTAINING_RECORD(it, TRACKED_DLL, ListEntry);
+
+        // Salvamos o próximo antes de uma possível remoção
+        PLIST_ENTRY next = it->Flink;
+
+        if (RtlCompareUnicodeString(&entry->FullPath, FullImageName, TRUE) == 0) {
+            // DETECTADO: Remove da lista e libera memória
+            RemoveEntryList(it);
+            LiberarEntrada(entry);
+            g_ItemCount--;
+
+            detectado = TRUE;
+            break; // Já encontramos, podemos sair
+        }
+        it = next;
+    }
+
+    KeReleaseGuardedMutex(&g_ListMutex);
+    return detectado;
+}*/
+
+/**
+ * Extrai o nome do arquivo de um caminho completo.
+ * Retorna um ponteiro para a posição dentro da string original.
+ */
+PCWSTR ExtrairNomeDll(PUNICODE_STRING FullImageName) {
+    if (FullImageName == NULL || FullImageName->Buffer == NULL || FullImageName->Length == 0) {
+        return L"Desconhecido";
+    }
+
+    // Calcula o número de caracteres (Length é em bytes)
+    USHORT nChars = FullImageName->Length / sizeof(WCHAR);
+    PWCH buffer = FullImageName->Buffer;
+
+    // Percorre de trás para frente
+    for (int i = nChars - 1; i >= 0; i--) {
+        if (buffer[i] == L'\\') {
+            // Retorna o ponteiro logo após a última barra
+            return &buffer[i + 1];
+        }
+    }
+
+    // Se não houver barras, o nome é a própria string
+    return buffer;
+}
+
+
+// Callback que intercepta dlls carregadas por processos já em execução (LoadImage).
+void ImageNotifyRoutine(
+    PUNICODE_STRING FullImageName,
+    HANDLE ProcessId,
+    PIMAGE_INFO ImageInfo
+) {
+    UNREFERENCED_PARAMETER(ImageInfo);
+    ULONG pidInt = HandleToULong(ProcessId);
+    PVOID* bufferSaida = NULL;
+    SIZE_T tamanhoSaida = 0;
+
+    // REGRA DE OURO: Se o Monitor não esta online, libera tudo (Fail-Open)
+    if (!IsMonitoramentoSaudavel()) {
+        if (g_Debug) DbgPrint("[SENTINELA] ImageNotifyRoutine: Bypass monitor desativado: (PID %lu)\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine: (PID %lu)\n", pidInt);
+        return;
+    }
+
+	// verifica se o processo atual (que está tentando carregar a imagem) está na lista de morte
+    if (IsPidInKillingList(ProcessId)) {
+        // Se o PID está na lista de morte, não crie contextos novos!
+        // Apenas retorne STATUS_ACCESS_DENIED ou deixe o Windows barrar.
+        DbgPrint("[SENTINELA] ImageNotifyRoutine Bloqueando nova tentativa de carga para PID em extinção: %lu\n", pidInt);
+        // CRIAMOS UM WAIT INFINITO: A thread nunca retornará para o Windows.
+        // Ela ficará "congelada" aqui até que o ZwTerminateProcess a elimine.
+        KEVENT EventoZumbi;
+        KeInitializeEvent(&EventoZumbi, NotificationEvent, FALSE);
+
+        // Espera perpétua (não alertável)
+        KeWaitForSingleObject(&EventoZumbi, Executive, KernelMode, FALSE, NULL);
+    }
+
+    // Ignora drivers do sistema (PID 0) para evitar recursividade
+    if (ProcessId == NULL || ProcessId == (HANDLE)0) {
+        DbgPrint("[SENTINELA] ImageNotifyRoutine: Bypass: Ignora drivers do sistema (PID 0) para evitar recursividade: (PID %lu)\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine: (PID %lu)\n", pidInt);
+        return;
+    }
+
+    // Ignora drivers do sistema (PID 0) para evitar recursividade
+    if (ImageInfo->SystemModeImage != 0) {
+        DbgPrint("[SENTINELA] ImageNotifyRoutine: Bypass: Ignora drivers do sistema (SystemModeImage) para evitar recursividade: (PID %lu)\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine: (PID %lu)\n", pidInt);
+        return;
+    }
+
+    // Ignora drivers do sistema (PID 0) para evitar recursividade
+    if (FullImageName == NULL || FullImageName->Length == 0) {
+        DbgPrint("[SENTINELA] ImageNotifyRoutine: Bypass: Ignora drivers do sistema (FullImageName Nulo) para evitar recursividade: (PID %lu)\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine: (PID %lu)\n", pidInt);
+        return;
+    }
+
+    // 1. Filtros de segurança e bypass
+    if (!FullImageName || !ProcessId || ProcessId == (HANDLE)4) {
+        DbgPrint("[SENTINELA] ImageNotifyRoutine: Bypass: Processos do sistema (PID 4) para evitar recursividade: (PID %lu)\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine: (PID %lu)\n", pidInt);
+        return;
+    }
+
+    // Ignora o seu próprio Monitor e o ClamD
+    if (ProcessId == g_MonitorPid || ProcessId == g_ClamdPid) {
+        DbgPrint("[SENTINELA] ImageNotifyRoutine: Bypass: Processos do monitor e do clamav: (PID %lu)\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine: (PID %lu)\n", pidInt);
+        return;
+    }
+
+    // incrementa contador de threads
+    InterlockedIncrement(&g_ActiveThreads);
+
+    /*
+	// checa evasao de DLL: Se o arquivo sumiu ou vai sumir, é um forte indicativo de malware (Dump da RAM).
+    // 3. ROTA DE DUMP (Apenas se o arquivo sumiu)
+    if (checa_evasao_dll(FullImageName)) {
+        //DbgPrint("EDR: DLL Fantasma detectada: %wZ. Iniciando Dump da RAM...\n", FullImageName);
+        
+        DbgPrint("!!! ALERTA EDR !!! Execução de DLL com Delete-on-Close detectada: %wZ (PID: %d)\n",
+            FullImageName, pidInt);
+
+        // Aqui você pode chamar seu DumpProcessoAtivoPorPID que já criamos!
+        NTSTATUS status = DumpDllPorNome(ProcessId, ExtrairNomeDll(FullImageName), bufferSaida, &tamanhoSaida);
+
+		// se status for sucesso, o bufferSaida conterá o dump reconstruído da imagem
+		// e deve ser desalocado para evitar vazamento de memória tag:'dump'
+        
+        if NT_SUCCESS(status) {
+            DbgPrint("EDR: Dump da RAM bem-sucedido para PID %d. Enviando para análise...\n", pidInt);
+            // Aqui você pode criar um contexto de scan específico para o dump e enviá-lo para o Python, similar ao processo normal.
+            // Lembre-se de liberar bufferSaida com ExFreePoolWithTag(bufferSaida, 'dump') após o envio.
+        }
+        else {
+            DbgPrint("EDR: Falha ao realizar dump da RAM para PID %d. Status: 0x%X\n", pidInt, status);
+		}
+        
+    }*/
+
+    // Nome de arquivo convertido
+    UNICODE_STRING FileNameOk;
+    BOOLEAN tem_que_desalocar_buffer = converte_nome_arquivo(FullImageName, &FileNameOk);
+
+    // 2. Cache de Integridade (IsInIntegrityCache)
+    // Valores dos metadados do arquivo para 
+    LARGE_INTEGER fileDate = { 0 };
+    LARGE_INTEGER fileSize = { 0 };
+
+    // se bufferSaida for NULL signfica que vai pelo caminho normal
+    if (!bufferSaida) {
+        // 2. Bypass de Confiança (Sua whitelist de System32 KnownDLLs + PPL)
+        if (IsMicrosoftTrusted(&FileNameOk)) {
+            if (g_Debug) DbgPrint("[SENTINELA] ImageNotifyRoutine: Bypass: Processo confiavel PPL+KnownDLL: (PID %lu)\n", pidInt);
+            if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine (PID %lu)n", pidInt);
+
+            goto saida;
+        }
+
+        // Passo 1: Checa o Cache de Integridade (Bypass de Performance)
+        if (obtem_metadados_e_checa_cache(&FileNameOk, fileDate, fileSize)) {
+            if (g_Debug) DbgPrint("[SENTINELA] ImageNotifyRoutine: Cache Hit: Processo (PID %lu) liberado .\n", pidInt);
+            if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine: (PID %lu)\n", pidInt);
+
+            goto saida;
+        }
+    }
+
+    // 3.1 Preparar contexto para as informacoes do arquivo
+    PSCAN_RESPONSE_QUEUE ctx_scan_response = CriarContextoScanResponse(&FileNameOk, ProcessId, fileDate, fileSize);
+    if (!ctx_scan_response) {
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine: (PID %lu)\n", pidInt);
+        
+        goto saida;
+    }
+
+    guardar_ctx_scan_response(ctx_scan_response);
+
+    // 3. Preparar contexto para o Python
+	PSCAN_CONTEXT ctx_scan = CriarContextoScan(ctx_scan_response, ProcessId, bufferSaida, ULONG(tamanhoSaida));
+    if (!ctx_scan) {
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine: (PID %lu)\n", pidInt);
+        
+        goto saida_ctx_scan_response;
+    }
+
+    //envia para fila e avisa o python
+    envia_ctx_scan_para_fila(ctx_scan);
+
+    // incrementa o contador de itens na fila (saldo)
+    InterlockedIncrement(&g_QueueCount);
+
+    // DbgPrint("[SENTINELA] ImageNotifyRoutine: enviando processo para fila. PID: %d tamanho fila atual: %d  tamanho do cache: %d\n", pidInt, g_QueueCount, g_CacheCount);
+
+    //if (g_Debug) DbgPrint("[SENTINELA] ImageNotifyRoutine: Esperando veredito para (PID %d): %wZ.\n", pidInt, PrefixoOk);
+    // espera a resposta, lida com timeouts e atualiza o veredito
+    if (wait_verdict_event_and_cleanup(ctx_scan, ctx_scan_response, ProcessId)) {
+		// Permitido pelo Python
+        if (g_Debug) DbgPrint("[SENTINELA] ImageNotifyRoutine: Veredito recebido para (PID %lu): PERMITIDO\n", pidInt);
+    }
+    else {
+        
+        // Negado por virus
+        DbgPrint("[SENTINELA] ImageNotifyRoutine: Veredito recebido para (PID %lu): BLOQUEADO\n", pidInt);
+        
+        // --- DENTRO DO BLOCO DE VEREDITO NEGATIVO ---
+        DbgPrint("[SENTINELA] Iniciando Drenagem e Kill do PID %lu\n", pidInt);
+
+        // 1. Impede novos scans (Quarentena)
+        AddPidToKillingList(ProcessId);
+
+        // 2. Cancelas as threads que já estão na fila
+        CancelarResponseQueuePorProcesso(ProcessId);
+
+        // 4. LIMPEZA DA THREAD ATUAL (Antes do Kill)
+        // Como essa thread está "fora" da fila de resposta, ela limpa seus próprios contextos locais
+        if (ctx_scan) {
+            LimparScanContext(ctx_scan);
+            ctx_scan = NULL;
+        }
+        if (ctx_scan_response) {
+            LimparScanResponseQueue(ctx_scan_response);
+            ctx_scan_response = NULL;
+        }
+        // 5. O TIRO DE MISERICÓRDIA (Seguro: filas zeradas, memória Pool liberada)
+        ZwTerminateProcess(NtCurrentProcess(), STATUS_ACCESS_DENIED);
+
+        // 6. SAI DA QUARENTENA E LIMPA BUFFER LOCAL
+        RemovePidFromKillingList(ProcessId);
+        goto saida; // Vai para a label onde libera o buffer 'Temp'
+    }
+
+    if (ctx_scan) LimparScanContext(ctx_scan);
+
+    saida_ctx_scan_response:
+
+    if (ctx_scan_response) LimparScanResponseQueue(ctx_scan_response);
+
+    saida:
+
+    if (tem_que_desalocar_buffer) {
+        ExFreePoolWithTag(FileNameOk.Buffer, 'Temp');
+    }
+
+    if (g_Debug) DbgPrint("[SENTINELA] Encerrando ImageNotifyRoutine (PID %lu)\n", pidInt);
+
+    // decrementa contador de threads
+    if (InterlockedDecrement(&g_ActiveThreads) == 0) {
+        KeSetEvent(&g_UnloadEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+// Callback de Interceptação
+void ProcessNotifyRoutineEx(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo) {
+    UNREFERENCED_PARAMETER(Process);
+    ULONG pidInt = HandleToULong(ProcessId);
+    PVOID* bufferSaida = NULL;
+    SIZE_T tamanhoSaida = 0;
+
+    // REGRA DE OURO: Se o Monitor não estiver ativo e online, libera tudo (Fail-Open)
+    if (!IsMonitoramentoSaudavel()) {
+        if (g_Debug) DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: Bypass monitor desativado: (PID %lu)\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ProcessNotifyRoutineEx: (PID %lu)\n", pidInt);
+        return;
+    }
+
+    if (!CreateInfo) {
+        if (g_Debug) DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: Processo (PID %lu) está encerrando.\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ProcessNotifyRoutineEx: (PID %lu)\n", pidInt);
+        return; // Se CreateInfo é nulo, o processo está fechando. Ignoramos.
+    }
+
+	// checa se esta na lista de morte antes de criar contextos novos, isso evita que processos maliciosos criem muitos subprocessos para encher a fila e causar um DoS
+    if (IsPidInKillingList(ProcessId) || IsPidInKillingList(CreateInfo->ParentProcessId)) {
+        DbgPrint("[SENTINELA] ProcessNotifyRoutineEx BLOQUEIO: PID infectado %lu tentou criar subprocesso. Negando.\n", pidInt);
+        CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
+        return;
+    }
+
+    if (!ProcessId || ProcessId == (HANDLE)4) {
+        DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: Bypass: Processos do sistema (PID 4) para evitar recursividade: (PID %lu)\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ProcessNotifyRoutineEx: (PID %lu)\n", pidInt);
+        return;
+    }
+
+    // Ignora o seu próprio Monitor e o ClamD
+    if (ProcessId == g_MonitorPid || ProcessId == g_ClamdPid) {
+        DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: Bypass: Processos do monitor e do clamav: (PID %lu)\n", pidInt);
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ProcessNotifyRoutineEx: (PID %lu)\n", pidInt);
+        return;
+    }
+
+    // incrementa contador de threads
+    InterlockedIncrement(&g_ActiveThreads);
+
+    // 1. Detectar Evasão via FileObject
+	// detecta se o arquivo esta marcado para ser apagado o que inviabiliza a leitura do arquivo
+    if (CreateInfo->FileObject != NULL && CreateInfo->FileObject->DeletePending) {
+		DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: Detecção de evasão via FileObject: (PID %lu) tentou criar processo com arquivo marcado para exclusão...\n", pidInt);
+
+        NTSTATUS status;
+        status = DumpProcessoAtivoPorPEPROCESS(Process, bufferSaida, &tamanhoSaida);
+        
+    }
+
+	// fluxo normal retorna o nome do arquivo e os metadados para o monitoramento (ProcessNotifyRoutineEx)
+    UNICODE_STRING fileNameOk;
+    //converte o nome "limpo" do arquivo em fileNameOk
+    BOOLEAN tem_que_desalocar_buffer = converte_nome_arquivo((PUNICODE_STRING)CreateInfo->ImageFileName, &fileNameOk);
+
+    // Valores dos metadados do arquivo para 
+    LARGE_INTEGER fileDate = {0};
+    LARGE_INTEGER fileSize = {0};
+
+    // se bufferSaida é NUULL vai pelo caminho normal
+    if (!bufferSaida) {
+        // checa se é um dos serviços criticos do windows (liberados por whitelist)
+        if (IsMicrosoftTrusted(&fileNameOk)) {
+            //if (IsMicrosoftTrusted(Process, CreateInfo->ImageFileName, mtime, fsize, CreateInfo->FileObject)) {
+            if (g_Debug) DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: Bypass: Processo confiavel PPL+KnownDLL: (PID %lu)\n", pidInt);
+            if (g_Debug) DbgPrint("[SENTINELA] Encerrando ProcessNotifyRoutineEx PID %lu.\n", pidInt);
+
+            goto saida;
+        }
+
+        // Passo 1: Checa o Cache de Integridade (Bypass de Performance)
+        if (obtem_metadados_e_checa_cache(&fileNameOk, fileDate, fileSize)) {
+            if (g_Debug) DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: Cache Hit: Processo (%lu -  %wZ) liberado .\n", pidInt, fileNameOk);
+            if (g_Debug) DbgPrint("[SENTINELA] Encerrando ProcessNotifyRoutineEx PID %lu.\n", pidInt);
+
+            goto saida;
+        }
+    }
+
+    // Se chegou aqui (Cache Miss ou Erro de Metadados), segue para o SCAN...
+    if (g_Debug) DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: Adicionando (PID %lu) ao contexto de espera...\n", pidInt);
+
+    // Passo 2: Se é desconhecido, cria um "Contexto de Espera"
+    PSCAN_RESPONSE_QUEUE ctx_scan_response = CriarContextoScanResponse(&fileNameOk, ProcessId, fileDate, fileSize);
+    if (!ctx_scan_response) {
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ProcessNotifyRoutineEx (PID %lu): %wZ\n", pidInt, fileNameOk);
+        
+        goto saida;
+    }
+
+	guardar_ctx_scan_response(ctx_scan_response);
+
+    // Passo 2: Se é desconhecido, cria um "Contexto de scan"
+    PSCAN_CONTEXT ctx_scan = CriarContextoScan(ctx_scan_response, ProcessId, bufferSaida, ULONG(tamanhoSaida));
+    if (!ctx_scan) {
+        if (g_Debug) DbgPrint("[SENTINELA] Encerrando ProcessNotifyRoutineEx (PID %lu): %wZ\n", pidInt, fileNameOk);
+        
+        goto saida_ctx_scan_response;
+    }
+
+    //if (g_Debug) DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: Esperando veredito para (PID %d).\n", pidInt);
+    // Passo 3: Coloca na fila de espera e avisa o Python (Sinaliza o Evento)
+    // so envia pra fila se o contexto ainda eh valido (ja que ele pode se invalidado por um cleanup
+    envia_ctx_scan_para_fila(ctx_scan);
+
+    // incrementa o contador de itens na fila (saldo)
+    InterlockedIncrement(&g_QueueCount);
+
+    // DbgPrint("[SENTINELA] ProcessNotifyRoutineEx: enviando processo para fila. PID: %d tamanho fila atual: %d  tamanho do cache: %d\n", pidInt, g_QueueCount, g_CacheCount);
+
+    // espera pelo evento, lida com timeouts e atualiza veredito
+    if (wait_verdict_event_and_cleanup(ctx_scan, ctx_scan_response, ProcessId)) {
+        // Permitido pelo Python
+        if (g_Debug) DbgPrint("[SENTINELA] ImageNotifyRoutine: Veredito recebido para (PID %lu): PERMITIDO\n", pidInt);
+    }
+    else {
+        // Negado por virus
+        if (g_Debug) DbgPrint("[SENTINELA] ImageNotifyRoutine: Veredito recebido para (PID %lu): BLOQUEADO\n", pidInt);
+    }
+    // atualiza CreateInfo->CreationStatus com o veredito recebido
+    CreateInfo->CreationStatus = ctx_scan_response->Status;
+
+    LimparScanContext(ctx_scan);
+    
+    saida_ctx_scan_response:
+
+    LimparScanResponseQueue(ctx_scan_response);
+
+    saida:
+
+    if (tem_que_desalocar_buffer) {
+        ExFreePoolWithTag(fileNameOk.Buffer, 'Temp');
+    }
+
+    if (g_Debug) DbgPrint("[SENTINELA] Encerrando ProcessNotifyRoutineEx PID %lu.\n", pidInt);
+
+    // decrementa contador de threads
+    if (InterlockedDecrement(&g_ActiveThreads) == 0) {
+        KeSetEvent(&g_UnloadEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+// --- DISPATCHER (A PONTE ENTRE O PYTHON E O DRIVER) ---
+// Dispatcher de IOCTLs
+NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    ULONG inputBufferLength = irpSp->Parameters.DeviceIoControl.InputBufferLength;
+    ULONG OutputBufferLength = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG bytesReturned = 0;
+    ULONG controlCode = irpSp->Parameters.DeviceIoControl.IoControlCode;
+    //int qtdProcessos = 0;
+
+    // Trata os comandos vindos do Dashboard Python
+    switch (controlCode) {
+        case IOCTL_GET_STATUS: {
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+            PUCHAR buffer = (PUCHAR)Irp->AssociatedIrp.SystemBuffer;
+            ULONG bytesNeeded = (ULONG)(sizeof(STATUS_RESPONSE));
+            if (OutputBufferLength >= bytesNeeded) {
+                PSTATUS_RESPONSE pStatus = (PSTATUS_RESPONSE)buffer;
+                RtlZeroMemory(buffer, OutputBufferLength);
+
+                pStatus->ActiveThreads = InterlockedCompareExchange(&g_ActiveThreads, 0, 0);
+                pStatus->QueueCount = InterlockedCompareExchange(&g_QueueCount, 0, 0);
+                pStatus->CacheCount = g_CacheCount;
+                pStatus->ContadorTimeouts = InterlockedCompareExchange(&g_contador_timeouts, 0, 0);
+				pStatus->QueueMaxThreshold = g_QUEUE_MAX_THRESHOLD;
+				pStatus->CacheMaxEntries = g_MAX_CACHE_ENTRIES;
+				pStatus->TempoTimeout = g_TEMPO_TIMEOUT;
+				pStatus->FailClose = g_fail_close;
+
+                bytesReturned = sizeof(STATUS_RESPONSE);
+                status = STATUS_SUCCESS;
+            }
+            else {
+                // Informa ao Python quanto de memória ele precisa alocar
+                Irp->IoStatus.Information = bytesNeeded;
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+            break;
+        }
+
+        case IOCTL_SET_CONFIG: {
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+            PUCHAR buffer = (PUCHAR)Irp->AssociatedIrp.SystemBuffer;
+
+            bytesReturned = (ULONG)(sizeof(SAVE_SETTINGS));
+            if (inputBufferLength >= bytesReturned) {
+                PSAVE_SETTINGS pSaveSettings = (PSAVE_SETTINGS)buffer;
+
+                g_QUEUE_MAX_THRESHOLD = pSaveSettings->QueueMaxThreshold;
+                g_MAX_CACHE_ENTRIES = pSaveSettings->CacheMaxEntries;
+                g_TEMPO_TIMEOUT = pSaveSettings->TempoTimeout;
+                g_fail_close = pSaveSettings->FailClose;
+
+				status = STATUS_SUCCESS;
+                }
+            else {
+                status = STATUS_BUFFER_TOO_SMALL;
+			}
+
+            KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+            break;
+        }
+
+        case IOCTL_REG_EVENT: {
+            if (inputBufferLength >= sizeof(REGISTRATION_PACKET)) {
+                PREGISTRATION_PACKET pReg = (PREGISTRATION_PACKET)Irp->AssociatedIrp.SystemBuffer;
+
+                // 1. Registra os PIDs
+                g_MonitorPid = pReg->MonitorPid;
+                g_ClamdPid = pReg->ClamdPid;
+
+                // monitoramento aitvo
+                g_PythonFileObject = irpSp->FileObject; // Carimba o dono
+                InterlockedExchange(&g_PythonActive, 1);
+				// reseta contador de fila
+                InterlockedExchange(&g_QueueCount, 0);
+
+                // 2. Registra o Evento
+                PKEVENT newEvent = NULL;
+                status = ObReferenceObjectByHandle(pReg->EventHandle, EVENT_MODIFY_STATE,
+                    *ExEventObjectType, UserMode, (PVOID*)&newEvent, NULL);
+                if (NT_SUCCESS(status)) {
+                    PKEVENT old = (PKEVENT)InterlockedExchangePointer((PVOID*)&g_MonitorEvent, newEvent);
+                    if (old) ObDereferenceObject(old);
+                    DbgPrint("[SENTINELA] IOCTL_REG_EVENT Monitor Ativado: (PID %lu) vinculado com sucesso.\n", HandleToULong(g_MonitorPid));
+                }
+            }
+            else {
+                status = STATUS_BUFFER_TOO_SMALL;
+            }
+            break;
+        }
+
+        case IOCTL_UNREG_EVENT: {
+            DbgPrint("[SENTINELA] Desativando monitor e liberando todos os processos...\n");
+
+            // 1. Impede que novos itens entrem na fila
+            InterlockedExchangePointer((PVOID volatile*)&g_MonitorEvent, NULL);
+
+            // os processos serao liberados pelo cleanup assim que o driver se desconectar do python
+
+            // Limpa PIDs e referências
+            g_MonitorPid = NULL;
+            g_ClamdPid = NULL;
+
+            status = STATUS_SUCCESS;
+
+            break;
+        }
+
+        case IOCTL_GET_ITEM: {
+            PUCHAR buffer = (PUCHAR)Irp->AssociatedIrp.SystemBuffer;
+			USHORT tamanho_nomearquivo = 0;
+            UNICODE_STRING nomearquivo;
+
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+
+            if (IsListEmpty(&g_ScanQueueHead)) {
+                KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+                status = STATUS_NO_DATA_DETECTED;
+                break;
+            }
+
+            //PLIST_ENTRY entry = RemoveHeadList(&g_ScanQueueHead);
+            PLIST_ENTRY entry = g_ScanQueueHead.Flink;
+            PSCAN_CONTEXT ctx = CONTAINING_RECORD(entry, SCAN_CONTEXT, ListEntry);
+            PSCAN_RESPONSE_QUEUE ctx_scan_response = ctx->ResponseContext;
+
+            // 2. Verifica se o buffer do Python aguenta o nome do arquivo
+
+            // checa se o driver manteve o nt prefix
+            if (RtlPrefixUnicodeString(&prefixNT, &ctx_scan_response->FileName, TRUE)) {
+                tamanho_nomearquivo = ctx_scan_response->FileName.Length - prefixNT.Length;
+				nomearquivo.Buffer = (PWSTR)((PCHAR)ctx_scan_response->FileName.Buffer + prefixNT.Length);
+				nomearquivo.Length = tamanho_nomearquivo;
+				nomearquivo.MaximumLength = tamanho_nomearquivo;
+            }
+            else {
+                // se nao manteve manda completo.
+                tamanho_nomearquivo = ctx_scan_response->FileName.Length;
+                nomearquivo.Buffer = ctx_scan_response->FileName.Buffer;
+                nomearquivo.Length = tamanho_nomearquivo;
+                nomearquivo.MaximumLength = tamanho_nomearquivo;
+            }
+
+            ULONG bytesNeeded = (ULONG)(sizeof(HANDLE) + sizeof(PVOID) + sizeof(USHORT) + tamanho_nomearquivo);
+
+            if (ctx->PEDUMP) {
+                bytesNeeded += sizeof(ULONG) + ctx->PEDUMP_Length;
+            }
+
+            if (OutputBufferLength < bytesNeeded) {
+                KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+                // Informa ao Python quanto de memória ele precisa alocar
+                bytesReturned = bytesNeeded;
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            // 3. Se couber, aí sim REMOVEMOS de forma definitiva
+            RemoveEntryList(entry);
+            // Aqui sim, marcamos como NULL pois ele saiu da fila de scan para ser processado
+            InitializeListHead(entry);
+
+            // BUFFER OK: Copia os dados normalmente
+            // 1. Copia o PID
+            RtlCopyMemory(buffer, &ctx->ProcessId, sizeof(HANDLE));
+            int offset = sizeof(HANDLE);
+            // 2. Copia o endereço do ponteiro de contexto de file data (que vai ser usado para ler os metadados do arquivo)
+            PVOID ctxPointerValue = (PVOID)ctx_scan_response;
+            RtlCopyMemory(buffer + offset, &ctxPointerValue, sizeof(PVOID));
+            offset += sizeof(PVOID);
+            // 3. Copia o  (USHORT)tamanho + Nome logo em seguida
+            RtlCopyMemory(buffer + offset, &tamanho_nomearquivo, sizeof(USHORT));
+            offset += sizeof(USHORT);
+            RtlCopyMemory(buffer + offset, nomearquivo.Buffer, tamanho_nomearquivo);
+			offset += tamanho_nomearquivo;
+            // 4. Copia o Dump apos o nome (se fornecido)
+            if (ctx->PEDUMP) {
+                RtlCopyMemory(buffer + offset, &ctx->PEDUMP_Length, sizeof(ULONG));
+                offset += sizeof(ULONG);
+                RtlCopyMemory(buffer + offset, (PCHAR)ctx->PEDUMP, ctx->PEDUMP_Length);
+				offset += ctx->PEDUMP_Length;
+				// dealoca o dump reconstruído da imagem após copiar para o buffer de saída do IOCTL
+				ExFreePoolWithTag(ctx->PEDUMP, 'dump');
+            }
+			bytesReturned = offset;
+
+            status = STATUS_SUCCESS;
+
+            KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+
+            break;
+        }
+        
+        case IOCTL_VERDICT: {
+            ULONG hash = 0;
+            LARGE_INTEGER mtime = {};
+            LARGE_INTEGER fsize = {};
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+
+            if (inputBufferLength >= sizeof(VERDICT_PACKET)) {
+                // 3. VALIDAÇÃO CRÍTICA: O objeto ainda é legítimo?
+                PVERDICT_PACKET pData = (PVERDICT_PACKET)Irp->AssociatedIrp.SystemBuffer;
+                PSCAN_RESPONSE_QUEUE ctx_response = (PSCAN_RESPONSE_QUEUE)pData->ContextPointer;
+
+                // 1. O "Pulo do Gato": Acesso Seguro com __try/__except
+                __try {
+                    // 2. VERIFICAÇÃO ATÔMICA: Eu sou o primeiro a chegar?
+                    if (ctx_response != NULL && ctx_response->StillAlive == MAGIC_NUMBER) {
+
+                        // 3. EU GANHEI A CORRIDA: Mato o Magic Number imediatamente
+                        ctx_response->StillAlive = 0;
+
+                        // 5. Aplica o veredito e acorda a thread que está no Wait
+                        ctx_response->Status = (pData->Verdict == TRUE) ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
+
+                        KeSetEvent(&ctx_response->ResponseEvent, IO_NO_INCREMENT, FALSE);
+                        status = STATUS_SUCCESS;
+
+                        // Captura dados para o cache
+                        if (pData->Verdict == TRUE) {
+                            hash = HashString(&ctx_response->FileName);
+                            mtime = ctx_response->MTime;
+                            fsize = ctx_response->FSize;
+                        }
+                    }
+                    else {
+                        // O TIMEOUT OU O CLEANUP GANHOU A CORRIDA
+                        // O StillAlive já é 0, então o item já foi removido ou cancelado.
+                        DbgPrint("[SENTINELA] IOCTL_VERDICT: Veredito ignorado Timeout ja processou o item (magic zerado).\n");
+                        status = STATUS_NOT_FOUND;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                    // se veredito foi verdadeiro extrai os dados para o cache mesmo assim
+                    DbgPrint("[SENTINELA] IOCTL_VERDICT: Veredito ignorado Timeout ja processou o item (ponteiro do contexto invalido).\n");
+                    status = STATUS_NOT_FOUND;
+                }
+                KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+
+                // adicona no cache se o veredito veio Limpo e obteve os metadados
+                if (pData->Verdict == TRUE && hash != 0) {
+                    if (status == STATUS_NOT_FOUND) {
+                        DbgPrint("[SENTINELA] IOCTL_VERDICT: Veredito ignorado vai ser adicionado ao cache para não desperdiçar o trabalho realizado.\n");
+                    }
+                    AddToCache(hash, mtime, fsize);
+                }
+            }
+            else {
+                status = STATUS_BUFFER_TOO_SMALL;
+                DbgPrint("[SENTINELA] IOCTL_VERDICT ERRO: Buffer recebido é muito pequeno.\n");
+            }
+
+            break;
+        }
+
+        case IOCTL_PID_DUMP: {  
+            // Implementação do Dump por PID
+            if (inputBufferLength >= sizeof(PID_DUMP_REQUEST)) {
+                PPID_DUMP_REQUEST pData = (PPID_DUMP_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+				HANDLE targetPid = pData->ProcessId;
+                LONG dllNameLength = pData->DllNameLength;
+                NTSTATUS dumpStatus;
+
+				PVOID bufferSaida = NULL;
+                SIZE_T tamanhoSaida = 0;
+                if (dllNameLength > 0) {
+                    PCWSTR dllName = (PCWCH)((PCHAR)Irp->AssociatedIrp.SystemBuffer + sizeof(PID_DUMP_REQUEST));
+                    dumpStatus = DumpDllPorNome(targetPid, dllName, &bufferSaida, &tamanhoSaida);
+                }
+                else {
+                    dumpStatus = DumpProcessoAtivoPorPID(targetPid, &bufferSaida, &tamanhoSaida);
+                }
+
+                if (NT_SUCCESS(dumpStatus)) {
+					//copiando o bufferSaida para o buffer de saída do IOCTL
+                    if (OutputBufferLength >= sizeof(PID_DUMP_RESPONSE) + tamanhoSaida) {
+                        PPID_DUMP_RESPONSE pResponse = (PPID_DUMP_RESPONSE)Irp->AssociatedIrp.SystemBuffer;
+                        RtlZeroMemory(pResponse, OutputBufferLength);
+						pResponse->ProcessId = targetPid;
+                        pResponse->DumpSize = ULONG(tamanhoSaida);
+                        RtlCopyMemory((PCHAR)pResponse + sizeof(PID_DUMP_RESPONSE), bufferSaida, tamanhoSaida);
+                        status = STATUS_SUCCESS;
+					}
+                    else {
+                        DbgPrint("[SENTINELA] IOCTL_PID_DUMP ERRO: Buffer de saída é muito pequeno para conter o dump da RAM para PID %ld. Necessário: %lu bytes.\n", HandleToLong(targetPid), ULONG(sizeof(PID_DUMP_RESPONSE) + tamanhoSaida));
+						status = STATUS_BUFFER_TOO_SMALL;
+                    }
+                    ExFreePoolWithTag(bufferSaida, 'dump');
+
+					bytesReturned = ULONG(sizeof(PID_DUMP_RESPONSE) + tamanhoSaida); // Ajuste conforme a estrutura real do PID_DUMP_RESPONSE
+                }
+                else {
+                    DbgPrint("[SENTINELA] IOCTL_PID_DUMP ERRO: Falha ao realizar dump da RAM para PID %ld. Status: 0x%X\n", HandleToLong(targetPid), dumpStatus);
+                    status = dumpStatus;
+                    bytesReturned = 0;
+				}
+            }
+            break;
+		}
+    }
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = bytesReturned;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+NTSTATUS SentinelaCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+    // STATUS_SUCCESS é o que faz o Python parar de dar erro 1
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS SentinelaCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    PIO_STACK_LOCATION sl = IoGetCurrentIrpStackLocation(Irp);
+
+    // Se quem está fechando o handle é o "dono" do monitoramento
+    if (sl->FileObject != NULL && sl->FileObject == g_PythonFileObject) {
+        DbgPrint("[SENTINELA] Watchdog: Conexão com Python foi perdida. Bypass ativado.\n");
+
+        InterlockedExchange(&g_PythonActive, 0);
+        g_PythonFileObject = NULL;
+
+        // Libera tudo e acorda quem está esperando
+        LiberarResponseQueueGeral();
+    }
+
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS InitializeSystemPathCache() {
+    USHORT size;
+    // inicializa o winRoot
+    winRoot_setup();
+    if (winRoot.Buffer) {
+        // Calcula o tamanho: Raiz + "\System32\" (20 bytes para 10 WCHARs)
+        size = winRoot.Length + system32Dir.Length + sizeof(WCHAR);
+        g_winSystem32Path.Buffer = (PWCH)Malloc(size, 'tag2');
+        if (!g_winSystem32Path.Buffer) return STATUS_INSUFFICIENT_RESOURCES;
+        RtlZeroMemory(g_winSystem32Path.Buffer, size);
+        g_winSystem32Path.MaximumLength = size;
+        RtlCopyMemory(g_winSystem32Path.Buffer, winRoot.Buffer, winRoot.Length);
+        g_winSystem32Path.Length = winRoot.Length;
+        RtlCopyMemory((PCHAR)g_winSystem32Path.Buffer + g_winSystem32Path.Length, system32Dir.Buffer, system32Dir.Length);
+        g_winSystem32Path.Length += system32Dir.Length;
+    } else {
+        UNICODE_STRING fallback = RTL_CONSTANT_STRING(L"C:\\Windows\\System32\\");
+        size = fallback.Length + sizeof(WCHAR);
+        g_winSystem32Path.Buffer = (PWCH)Malloc(size, 'tag2');
+        RtlZeroMemory(g_winSystem32Path.Buffer, size);
+        // Fallback: Se por algum motivo não conseguimos obter o caminho do Windows, usamos um valor padrão (menos seguro)
+        RtlCopyMemory(g_winSystem32Path.Buffer, fallback.Buffer, size);
+        g_winSystem32Path.Length = size;
+        g_winSystem32Path.MaximumLength = size;
+	}
+
+    if (g_Debug) DbgPrint("[SENTINELA] InitializeSystemPathCache: Alocando %d bytes para guardar \"%wZ\".\n", size, g_winSystem32Path);
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS InitDevicePrefix() {
+	// tempBuffer é um buffer temporário para resolver o link simbólico do drive (ex: \\??\\C: para \Device\HarddiskVolume2)
+    UNICODE_STRING tempPrefix;
+    WCHAR buffer[256];
+    
+    // 1. Inicializa a struct temporária apontando para o buffer da stack
+    RtlZeroMemory(buffer, sizeof(buffer));
+	tempPrefix.Buffer = buffer;
+	tempPrefix.MaximumLength = sizeof(buffer);
+    tempPrefix.Length = 0;
+
+    UNICODE_STRING driveLink;
+	// Unicode aponta apenas para o "C:" da sua variável existente "C:\Windows\System32"
+    driveLink.Buffer = g_winSystem32Path.Buffer;
+    driveLink.Length = 4; // 2 caracteres * 2 bytes (C:)
+    driveLink.MaximumLength = 4;
+    
+	// tempBuffer2 vai guardar apenas "\\??\\C:" (6 caracteres) para resolver o link simbólico
+	WCHAR tempBuffer2[7];
+    RtlZeroMemory(tempBuffer2, sizeof(tempBuffer2));
+    UNICODE_STRING ntPath;
+	ntPath.Buffer = tempBuffer2;
+	ntPath.MaximumLength = sizeof(tempBuffer2);
+
+    RtlCopyMemory((PCHAR)ntPath.Buffer, prefixNT.Buffer, prefixNT.Length);
+	ntPath.Length = 8;
+    RtlCopyMemory((PCHAR)ntPath.Buffer + ntPath.Length, driveLink.Buffer, driveLink.Length);
+	ntPath.Length += driveLink.Length;
+
+    OBJECT_ATTRIBUTES objAttr;
+    HANDLE handle;
+    InitializeObjectAttributes(&objAttr, &ntPath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    NTSTATUS status = ZwOpenSymbolicLinkObject(&handle, GENERIC_READ, &objAttr);
+    if (NT_SUCCESS(status)) {
+        // 2. Resolve o link. Passamos o endereço da struct, que aponta para o nosso buffer.
+		// Resolve o link para algo como \Device\HarddiskVolume2 em tempPrefix
+        status = ZwQuerySymbolicLinkObject(handle, &tempPrefix, NULL);
+        ZwClose(handle);
+
+        if (NT_SUCCESS(status)) {
+            // copia o resultado para a variável global g_DevicePrefix
+            // alocando memoria no heap do kernel para guardar o prefixo do dispositivo
+            // 3. Aloca memória global exata (tempPrefix.Length já vem em bytes)
+            g_DevicePrefix.Buffer = (PWCH)Malloc(tempPrefix.Length, 'tag1');
+
+            if (g_DevicePrefix.Buffer) {
+                // 4. CORREÇÃO: Preenchimento manual e seguro da global
+                g_DevicePrefix.Length = tempPrefix.Length;
+                g_DevicePrefix.MaximumLength = tempPrefix.Length;
+
+                // Copia os bytes brutos resolvidos pelo Kernel
+                RtlCopyMemory(g_DevicePrefix.Buffer, tempPrefix.Buffer, tempPrefix.Length);
+
+                if (g_Debug) DbgPrint("[SENTINELA] InitDevicePrefix: Prefix salvo: %wZ\n", &g_DevicePrefix);
+            }
+            else {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+            }
+        }
+        if (g_Debug) DbgPrint("[SENTINELA] InitDevicePrefix: Alocando %d bytes para guardar \"%wZ\".\n", tempPrefix.Length, tempPrefix);
+   }
+    return status;
+}
+
+/*
+// --- Callbacks do Minifiltro ---
+
+FLT_PREOP_CALLBACK_STATUS
+PreCreateCallback(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    PVOID* CompletionContext
+) {
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    // 1. Filtramos apenas operações de criação/abertura
+    if (Data->Iopb->MajorFunction != IRP_MJ_CREATE) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    ULONG options = Data->Iopb->Parameters.Create.Options;
+
+    // 2. Verificamos se a flag FILE_DELETE_ON_CLOSE está presente
+    if (options & FILE_DELETE_ON_CLOSE) {
+
+        PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+        NTSTATUS status = FltGetFileNameInformation(Data,
+            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+            &nameInfo);
+
+        if (NT_SUCCESS(status)) {
+            FltParseFileNameInformation(nameInfo);
+
+            // 3. Otimização: Só rastreamos se for uma DLL (ignore temporários comuns)
+            UNICODE_STRING extDll = RTL_CONSTANT_STRING(L"dll");
+            if (nameInfo->Extension.Length > 0 &&
+                RtlCompareUnicodeString(&nameInfo->Extension, &extDll, TRUE) == 0) {
+
+                KeAcquireGuardedMutex(&g_ListMutex);
+
+                // 4. Lógica FIFO: Se lotar, remove o mais antigo (Head)
+                if (g_ItemCount >= MAX_TRACKED_ITEMS) {
+                    PLIST_ENTRY oldest = RemoveHeadList(&g_TrackedDllList);
+                    if (oldest != &g_TrackedDllList) {
+                        PTRACKED_DLL oldestEntry = CONTAINING_RECORD(oldest, TRACKED_DLL, ListEntry);
+                        LiberarEntrada(oldestEntry);
+                        g_ItemCount--;
+                    }
+                }
+
+                // 5. Aloca e insere a nova DLL suspeita
+                PTRACKED_DLL entry = (PTRACKED_DLL)Malloc(sizeof(TRACKED_DLL), 'trck');
+                if (entry) {
+                    entry->FullPath.MaximumLength = nameInfo->Name.MaximumLength;
+                    entry->FullPath.Buffer = (PWCH)Malloc(entry->FullPath.MaximumLength, 'strg');
+
+                    if (entry->FullPath.Buffer) {
+                        RtlCopyUnicodeString(&entry->FullPath, &nameInfo->Name);
+                        InsertTailList(&g_TrackedDllList, &entry->ListEntry);
+                        g_ItemCount++;
+
+                        DbgPrint("[EDR] DLL adicionada ao rastreio FIFO: %wZ\n", &entry->FullPath);
+                    }
+                    else {
+                        ExFreePoolWithTag(entry, 'trck');
+                    }
+                }
+
+                KeReleaseGuardedMutex(&g_ListMutex);
+            }
+            FltReleaseFileNameInformation(nameInfo);
+        }
+    }
+
+    // Permitimos que a operação continue (não bloqueia o invasor, apenas vigia)
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+} */
+
+// Define a função de saída (Unload)
+// Driver unload routine (use C linkage)
+extern "C" VOID DriverUnload(PDRIVER_OBJECT DO) {
+    // Desregistra a callback de notificação
+    NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(ProcessNotifyRoutineEx, TRUE);
+    if (NT_SUCCESS(status)) {
+        if (g_Debug) DbgPrint("[SENTINELA] DriverUnload 1/6: Callback de notificação exe removida com sucesso.\n");
+    }
+    status = PsRemoveLoadImageNotifyRoutine(ImageNotifyRoutine);
+    if (NT_SUCCESS(status)) {
+        if (g_Debug) DbgPrint("[SENTINELA] DriverUnload 2/6: Callback de notificação dll removida com sucesso.\n");
+    }
+
+    // Limpeza das filas e cache
+	LiberarResponseQueueGeral();
+
+    // 3. O PULO DO GATO: Espera todas as threads saírem do código do Driver
+    if (InterlockedCompareExchange(&g_ActiveThreads, 0, 0) > 0) {
+        if (g_Debug) DbgPrint("[SENTINELA] DriverUnload: Aguardando %d threads finalizarem...\n", g_ActiveThreads);
+
+        KeWaitForSingleObject(&g_UnloadEvent, Executive, KernelMode, FALSE, NULL);
+    }
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_GlobalLock, &oldIrql);
+
+    // esvaziando a lista com os eventos de resposta, se ainda tem algo eh pq eh um resquicio que tem
+    // que ser desalocado agora.
+    while (!IsListEmpty(&g_ScanResponseQueueHead)) {
+        PLIST_ENTRY e = RemoveHeadList(&g_ScanResponseQueueHead);
+        PSCAN_RESPONSE_QUEUE ctx = CONTAINING_RECORD(e, SCAN_RESPONSE_QUEUE, ListEntry);
+        LimparScanResponseQueue(ctx);
+    }
+
+    while (!IsListEmpty(&g_ScanQueueHead)) {
+        PLIST_ENTRY e = RemoveHeadList(&g_ScanQueueHead);
+        PSCAN_CONTEXT ctx = CONTAINING_RECORD(e, SCAN_CONTEXT, ListEntry);
+        LimparScanContext(ctx);
+    }
+
+    KeReleaseSpinLock(&g_GlobalLock, oldIrql);
+
+    // LIMPEZA DA QUARENTENA NO UNLOAD
+    KIRQL killIrql;
+    KeAcquireSpinLock(&g_KillingPidsLock, &killIrql);
+
+    while (!IsListEmpty(&g_KillingPidsListHead)) {
+        PLIST_ENTRY e = RemoveHeadList(&g_KillingPidsListHead);
+        PKILLING_PID_ENTRY item = CONTAINING_RECORD(e, KILLING_PID_ENTRY, ListEntry);
+
+        // Libera a memória da estrutura de controle da quarentena
+        ExFreePoolWithTag(item, 'Kill');
+    }
+    // Resetamos o Header da lista por segurança (opcional, mas boa prática)
+    InitializeListHead(&g_KillingPidsListHead);
+
+    KeReleaseSpinLock(&g_KillingPidsLock, killIrql);
+    
+    if (g_Debug) DbgPrint("[SENTINELA] DriverUnload: Quarentena de PIDs finalizada com sucesso.\n");
+
+    KeEnterCriticalRegion();
+    ExAcquireResourceExclusiveLite(&g_CacheResource, TRUE);
+	// esvaziando a lista de cache
+    while (!IsListEmpty(&g_CacheListHead)) {
+        PLIST_ENTRY e = RemoveHeadList(&g_CacheListHead);
+        PCACHE_ENTRY c = CONTAINING_RECORD(e, CACHE_ENTRY, ListEntry);
+        ExFreePoolWithTag(c, 'Cach');
+        g_CacheCount--;
+    }
+    ExReleaseResourceLite(&g_CacheResource);
+    KeLeaveCriticalRegion();
+
+	// limpa o recurso do cache
+    if (g_CacheResourceInitialized) {
+        ExDeleteResourceLite(&g_CacheResource);
+    }
+    
+    if (g_winSystem32Path.Buffer) {
+        ExFreePoolWithTag(g_winSystem32Path.Buffer, 'tag2');
+        g_winSystem32Path.Buffer = NULL;
+    }
+
+    if (g_DevicePrefix.Buffer) {
+        ExFreePoolWithTag(g_DevicePrefix.Buffer, 'tag1');
+        g_DevicePrefix.Buffer = NULL;
+    }
+
+    if (g_Debug) DbgPrint("[SENTINELA] DriverUnload 3/6: Memoria nao paginavel liberada.\n");
+
+    /*
+    // 2. Finalizar o Minifiltro
+    if (g_FilterHandle != NULL) {
+        FltUnregisterFilter(g_FilterHandle);
+        g_FilterHandle = NULL;
+    }
+    DbgPrint("[EDR] Minifiltro finalizado.\n");
+
+    // 3. Limpar a lista encadeada (Esvaziar o Cache FIFO)
+    KeAcquireGuardedMutex(&g_ListMutex);
+
+    while (!IsListEmpty(&g_TrackedDllList)) {
+        PLIST_ENTRY pListEntry = RemoveHeadList(&g_TrackedDllList);
+        PTRACKED_DLL pEntry = CONTAINING_RECORD(pListEntry, TRACKED_DLL, ListEntry);
+
+        // Libera a string e a estrutura
+        LiberarEntrada(pEntry);
+        g_ItemCount--;
+    }
+
+    KeReleaseGuardedMutex(&g_ListMutex);
+    DbgPrint("[EDR] Lista global limpa. Itens restantes: %lu\n", g_ItemCount);
+    */
+
+    // Remove referência ao evento do Python, se existir
+    g_MonitorPid = NULL;
+    g_ClamdPid = NULL;
+    if (g_MonitorEvent) { ObDereferenceObject(g_MonitorEvent); g_MonitorEvent = NULL; }
+    if (g_Debug) DbgPrint("[SENTINELA] DriverUnload 4/6: Dereferenciando memoria alocada para o evento do monitor e zerando valores de pid recebidos.\n");
+
+    status = IoDeleteSymbolicLink(&g_SymLink);
+    if (NT_SUCCESS(status)) {
+        if (g_Debug) DbgPrint("[SENTINELA] DriverUnload 5/6: Node do dispositivo removido com sucesso.\n");
+    }
+    IoDeleteDevice(DO->DeviceObject);
+    if (g_Debug) DbgPrint("[SENTINELA] DriverUnload 6/6: Removido objeto do driver.\n");
+}
+
+// DriverEntry
+extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNREFERENCED_PARAMETER(RegistryPath);
+    DbgPrint("[SENTINELA] Iniciando Sentinela driver v0.2 - <joaogojunior@gmail.com> 09/03/2026.\n");
+    InitializeListHead(&g_ScanQueueHead);
+    if (IsListEmpty(&g_ScanQueueHead)) {
+        if (g_Debug) DbgPrint("[SENTINELA] Init 1/13 - Lista encadeada de scan inicializada com sucesso.\n");
+    }
+    InitializeListHead(&g_CacheListHead);
+    if (IsListEmpty(&g_CacheListHead)) {
+        if (g_Debug) DbgPrint("[SENTINELA] Init 2/13 - Lista encadeada de cache inicializada com sucesso.\n");
+	}
+    InitializeListHead(&g_ScanResponseQueueHead);
+    if (IsListEmpty(&g_ScanResponseQueueHead)) {
+        if (g_Debug) DbgPrint("[SENTINELA] Init 3/13 - Lista encadeada de dados de arquivos inicializada com sucesso.\n");
+    }
+    
+    /* //coisas do minifilter
+    InitializeListHead(&g_TrackedDllList);
+    KeInitializeGuardedMutex(&g_ListMutex);
+    g_ItemCount = 0;
+    */
+
+	// iniciar algumas variaveis globais
+    g_PythonActive = 0;
+    g_QueueCount = 0;
+    g_PythonFileObject = NULL;
+
+    // INICIALIZAÇÃO DA QUARENTENA (Deve estar no DriverEntry)
+    InitializeListHead(&g_KillingPidsListHead);
+    KeInitializeSpinLock(&g_KillingPidsLock);
+
+    // inicia ERESOURCE para o cache
+    NTSTATUS status = ExInitializeResourceLite(&g_CacheResource);
+    if (NT_SUCCESS(status)) {
+        g_CacheResourceInitialized = TRUE;
+    }
+
+    // g_UnloadEvent deve ser um KEVENT global
+    KeInitializeEvent(&g_UnloadEvent, NotificationEvent, FALSE);
+
+    // 2. INICIALIZAÇÃO DO CACHE DA CAMADA 3
+    NTSTATUS status1 = InitializeSystemPathCache();
+    if NT_SUCCESS(status1) {
+        if (g_Debug) DbgPrint("[SENTINELA] Init 4/13 - Salvo caminho do windows: %wZ.\n", g_winSystem32Path);
+    }
+
+    NTSTATUS status2 = InitDevicePrefix();
+    if NT_SUCCESS(status2) {
+        if (g_Debug) DbgPrint("[SENTINELA] Init 5/13 - Salvo prefixo de dispositivo: %wZ.\n", g_DevicePrefix);
+    }
+
+    KeInitializeSpinLock(&g_GlobalLock);
+
+    UNICODE_STRING devName = RTL_CONSTANT_STRING(DRIVER_DEVNAME);
+    
+    NTSTATUS status3 = IoCreateDevice(
+        DriverObject,
+        0,
+        &devName,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
+        &g_DeviceObject
+    );
+
+    if (NT_SUCCESS(status3)) {
+        if (g_Debug) DbgPrint("[SENTINELA] Init 6/13 - Objeto do driver inicializado com sucesso.\n");
+    }
+    NTSTATUS status4 = IoCreateSymbolicLink(&g_SymLink, &devName);
+    if (NT_SUCCESS(status4)) {
+        if (g_Debug) DbgPrint("[SENTINELA] Init 7/13 - Node do dispositivo criado com sucesso.\n");
+	}
+    if (g_Debug) DbgPrint("[SENTINELA] Init 8/13 - Registrando metodo de descarga.\n");
+    DriverObject->DriverUnload = DriverUnload;
+    if (g_Debug) DbgPrint("[SENTINELA] Init 9/13 - Inicializacao do DispatchDeviceControl.\n");
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
+	// resolver erro 1 do python: precisa ter Create e Close mesmo que não façam nada
+    if (g_Debug) DbgPrint("[SENTINELA] Init 10/13 Registrando metodos stub create e close.\n");
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = SentinelaCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = SentinelaCreateClose;
+    if (g_Debug) DbgPrint("[SENTINELA] Init 11/13 Registrando metodos de limpeza.\n");
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP] = SentinelaCleanup;
+    
+    /*
+    // 1. Definição das operações que o filtro vai monitorar
+    const FLT_OPERATION_REGISTRATION Callbacks[] = {
+        { IRP_MJ_CREATE,              // Intercepta a criação/abertura de arquivos
+          0,
+          PreCreateCallback,          // Sua função que checa o FILE_DELETE_ON_CLOSE
+          NULL },                     // Não precisamos de post-operação
+        { IRP_MJ_OPERATION_END }      // Marcador de fim da lista
+    };
+
+    // 2. A estrutura de registro principal do Minifiltro
+    const FLT_REGISTRATION FilterRegistration = {
+        sizeof(FLT_REGISTRATION),         // Tamanho da struct
+        FLT_REGISTRATION_VERSION,         // Versão (padrão do WDK)
+        0,                                // Flags
+        NULL,                             // Contextos
+        Callbacks,                        // A tabela de operações acima
+        NULL,                             // FilterUnload (pode ser NULL se usar DriverUnload)
+        NULL,                             // InstanceSetup
+        NULL,                             // InstanceQueryTeardown
+        NULL,                             // InstanceTeardownStart
+        NULL,                             // InstanceTeardownComplete
+        NULL, NULL, NULL                  // Reservados
+    };
+
+    
+    // registra callback mini filtro io
+    // 2. Registra o Minifiltro
+    // FilterRegistration é aquela struct que definimos com o PreCreateCallback
+    status = FltRegisterFilter(DriverObject, &FilterRegistration, &g_FilterHandle);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[EDR] Erro ao registrar Minifiltro: 0x%08X\n", status);
+        return status;
+    }
+
+    // 3. Inicia a filtragem de I/O
+    status = FltStartFiltering(g_FilterHandle);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[EDR] Erro ao iniciar filtragem: 0x%08X\n", status);
+        FltUnregisterFilter(g_FilterHandle);
+        return status;
+    }*/
+    
+    // registra o callback "sentinela"
+    NTSTATUS status5 = PsSetCreateProcessNotifyRoutineEx(ProcessNotifyRoutineEx, FALSE);
+    if (NT_SUCCESS(status5)) {
+        if (g_Debug) DbgPrint("[SENTINELA] Init 12/13 Callback de notificação registrada com sucesso.\n");
+	}
+    // No DriverEntry, após o PsSetCreateProcessNotifyRoutineEx:
+    NTSTATUS status6 = PsSetLoadImageNotifyRoutine(ImageNotifyRoutine);
+    if (NT_SUCCESS(status6)) {
+        if (g_Debug) DbgPrint("[SENTINELA] Init 13/13 - Monitor de DLLs ativado com sucesso.\n");
+    }
+    
+    // verificando se houve erros
+    status = STATUS_FAIL_CHECK;
+    if (status1 == STATUS_SUCCESS && status2 == STATUS_SUCCESS && status3 == STATUS_SUCCESS &&
+        status4 == STATUS_SUCCESS && status5 == STATUS_SUCCESS && status6 == STATUS_SUCCESS) {
+        status = STATUS_SUCCESS;
+    } else {
+        DbgPrint("[SENTINELA] Erros encontrados durante a inicialização, driver não será carregado.\n");
+    }
+    return status;
+}

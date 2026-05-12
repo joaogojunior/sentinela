@@ -1,7 +1,8 @@
 /*
     converte_nomes.sl.h -  esse arquivo contem uma implementacao em ambiente de kernel do windows para
-    converter os nomes de arquivos internos do NT iniciados com "\??\", "\SystemRoot" e "\Device" para
-    seu equivalente no sistema de arquivod do "DOS".
+    converter os nomes de arquivos internos do NT iniciados com "\SystemRoot" e "\Device" para o formato
+    "\??\".
+
     por joaogojunior@<gmail.com> em 16/03/2026
 
     o header shared_logic.h eh um hack para poder compilar esse codigo e poder testa-lo em modo usuario,
@@ -26,8 +27,8 @@ VOID winRoot_setup() {
     RtlInitUnicodeString(&winRoot, SharedUserData->NtSystemRoot);
 }
 
-// AlocaÁ„o de memÛria compatÌvel com Windows 7 atÈ o 11
-// NonPagedPool e POOL_FLAG_NON_PAGED: MemÛria que nunca sai da RAM (essencial para drivers)
+// Aloca√ß√£o de mem√≥ria compat√≠vel com Windows 7 at√© o 11
+// NonPagedPool e POOL_FLAG_NON_PAGED: Mem√≥ria que nunca sai da RAM (essencial para drivers)
 static PVOID Malloc(SIZE_T Size, ULONG Tag) {
 #if (NTDDI_VERSION >= NTDDI_WIN8)
     if (g_Debug) DbgPrint("[SENTINELA] Utilizando ExAllocatePool2 para alocar RAM.\n");
@@ -99,7 +100,7 @@ BOOLEAN caso15(PUNICODE_STRING FileName, PUNICODE_STRING FileNameOk, USHORT tama
         completeDeviceName.Length = tamanhoDevName_cache;
         completeDeviceName.MaximumLength = tamanhoDevName_cache;
 
-        // Calcula o sufixo do caminho original (o que vem apÛs o nome do dispositivo) para anexar depois
+        // Calcula o sufixo do caminho original (o que vem ap√≥s o nome do dispositivo) para anexar depois
         // reutilizando o buffer de FileName
         sufixo.Buffer = (PWCH)((PCHAR)FileName->Buffer + tamanhoDevName_cache);
         sufixo.Length = FileName->Length - tamanhoDevName_cache;
@@ -115,7 +116,7 @@ BOOLEAN caso15(PUNICODE_STRING FileName, PUNICODE_STRING FileNameOk, USHORT tama
         );
 
         if (NT_SUCCESS(status_objptr)) {
-            // Agora vocÍ tem o deviceObject para usar em IoVolumeDeviceToDosName
+            // Agora voc√™ tem o deviceObject para usar em IoVolumeDeviceToDosName
             // e assim obter o dosname do completedevicename encontrado
             // desalocar dosName se tiver sucesso
             status_dosname = IoVolumeDeviceToDosName(deviceObject, &tmpDosName);
@@ -125,7 +126,7 @@ BOOLEAN caso15(PUNICODE_STRING FileName, PUNICODE_STRING FileNameOk, USHORT tama
         }
 
         if (NT_SUCCESS(status_dosname)) {
-            // checa se o tamanhao de tmpDosName È 4
+            // checa se o tamanhao de tmpDosName √© 4
             if (tmpDosName.Length >= 4) {
                 dosName.Buffer = tmpDosName.Buffer;
                 dosName.Length = 4;
@@ -162,7 +163,7 @@ BOOLEAN caso15(PUNICODE_STRING FileName, PUNICODE_STRING FileNameOk, USHORT tama
         all_ok = FALSE;
     }
 
-    // LIMPEZA CENTRALIZADA (⁄nico lugar para evitar BSOD 18)
+    // LIMPEZA CENTRALIZADA (√önico lugar para evitar BSOD 18)
     if (NT_SUCCESS(status_objptr) && fileObject != NULL) {
         ObDereferenceObject(fileObject);
     }
@@ -198,17 +199,17 @@ BOOLEAN caso3(PUNICODE_STRING FileName, PUNICODE_STRING FileNameOk) {
             RtlCopyMemory((PCHAR)FileNameOk->Buffer + FileNameOk->Length, sufixo.Buffer, sufixo.Length);
             FileNameOk->Length += sufixo.Length;
 
-            // Se tudo deu certo, FileNameOk agora tem o caminho no formato C:\Windows\... correspondente ao caminho original que comeÁava com \SystemRoot\...
+            // Se tudo deu certo, FileNameOk agora tem o caminho no formato C:\Windows\... correspondente ao caminho original que come√ßava com \SystemRoot\...
             return TRUE;
 
         }
         else {
-            // Erro: Ao obter o caminho apÛs o prefixo \SystemRoot, o resultado È vazio ou inv·lido
-            DbgPrint("[SENTINELA] converte_nome_arquivo: - Erro - caso3: N„o foi possÌvel concatenar winroot %wZ.\n", winRoot);
+            // Erro: Ao obter o caminho ap√≥s o prefixo \SystemRoot, o resultado √© vazio ou inv√°lido
+            DbgPrint("[SENTINELA] converte_nome_arquivo: - Erro - caso3: N√£o foi poss√≠vel concatenar winroot %wZ.\n", winRoot);
         }
     }
     else {
-        DbgPrint("[SENTINELA] converte_nome_arquivo: - Erro - caso3: buffers nao inicializados ou inv·lidos.\n");
+        DbgPrint("[SENTINELA] converte_nome_arquivo: - Erro - caso3: buffers nao inicializados ou inv√°lidos.\n");
 
     }
     return FALSE;
@@ -257,7 +258,7 @@ BOOLEAN converte_nome_arquivo(PUNICODE_STRING FileName, PUNICODE_STRING FileName
     // se tamanho_necessario == 0 nao foi possivel calcular pq a entrada nao segue um padrao conhecido
     // nesse caso copia a entrada e ja era
     if (tamanho_necessario == 0) {
-        DbgPrint("[SENTINELA] converte_nome_arquivo: N„o foi possÌvel estimar o tamanho da string do nome, repassando o nome integralmente....");
+        DbgPrint("[SENTINELA] converte_nome_arquivo: N√£o foi poss√≠vel estimar o tamanho da string do nome, repassando o nome integralmente....");
 
         // fazendo o buffer de saida ser a copia apenas da estrutura da entrada sem copiar dados
         copia_unicode_data(FileName, FileNameOk);
@@ -269,7 +270,7 @@ BOOLEAN converte_nome_arquivo(PUNICODE_STRING FileName, PUNICODE_STRING FileName
     PVOID tempBuffer = Malloc(tamanho_necessario, 'Temp');
     if (!tempBuffer) {
         // se nao conseguiu alocar o buffer faz a copia da entrada na saida e avisa o erro
-        DbgPrint("[SENTINELA] converte_nome_arquivo: ERRO - N„o foi possÌvel alocar o buffer para o tamanho da string convertida: %d\n", tamanho_necessario);
+        DbgPrint("[SENTINELA] converte_nome_arquivo: ERRO - N√£o foi poss√≠vel alocar o buffer para o tamanho da string convertida: %d\n", tamanho_necessario);
 
         // fazendo o buffer de saida ser a copia apenas da estrutura da entrada sem copiar dados
         copia_unicode_data(FileName, FileNameOk);
